@@ -266,17 +266,18 @@ func (client *Client) DispatchWorkflow(ctx context.Context, token, repository, w
 	return response.WorkflowRunID, nil
 }
 
-func (client *Client) GetWorkflowJob(ctx context.Context, token, repository string, runID int64, jobName string) (WorkflowJob, error) {
+func (client *Client) GetWorkflowJob(ctx context.Context, token, repository string, runID int64, runAttempt int, jobName string) (WorkflowJob, error) {
 	owner, name, err := splitRepository(repository)
 	if err != nil {
 		return WorkflowJob{}, err
 	}
-	if runID <= 0 || strings.TrimSpace(jobName) == "" {
-		return WorkflowJob{}, fmt.Errorf("workflow run ID and job name are required")
+	if runID <= 0 || runAttempt <= 0 || strings.TrimSpace(jobName) == "" {
+		return WorkflowJob{}, fmt.Errorf("workflow run ID, attempt, and job name are required")
 	}
 	var response struct {
 		Jobs []struct {
 			ID          int64     `json:"id"`
+			RunAttempt  int       `json:"run_attempt"`
 			Name        string    `json:"name"`
 			Status      string    `json:"status"`
 			Conclusion  string    `json:"conclusion"`
@@ -284,7 +285,7 @@ func (client *Client) GetWorkflowJob(ctx context.Context, token, repository stri
 			CompletedAt time.Time `json:"completed_at"`
 		} `json:"jobs"`
 	}
-	path := "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/actions/runs/" + strconv.FormatInt(runID, 10) + "/jobs?filter=latest&per_page=100"
+	path := "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/actions/runs/" + strconv.FormatInt(runID, 10) + "/attempts/" + strconv.Itoa(runAttempt) + "/jobs?per_page=100"
 	if err := client.do(ctx, http.MethodGet, path, token, nil, http.StatusOK, &response); err != nil {
 		return WorkflowJob{}, err
 	}
@@ -295,6 +296,9 @@ func (client *Client) GetWorkflowJob(ctx context.Context, token, repository stri
 		}
 		if matched.ID != 0 {
 			return WorkflowJob{}, fmt.Errorf("GitHub workflow run contains multiple jobs named %q", jobName)
+		}
+		if job.RunAttempt != runAttempt {
+			return WorkflowJob{}, fmt.Errorf("GitHub workflow job %q does not belong to requested attempt %d", jobName, runAttempt)
 		}
 		if job.ID <= 0 || job.Status != "completed" || job.Conclusion == "" || job.StartedAt.IsZero() || job.CompletedAt.IsZero() || job.CompletedAt.Before(job.StartedAt) {
 			return WorkflowJob{}, fmt.Errorf("GitHub workflow job %q is incomplete", jobName)

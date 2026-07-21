@@ -331,8 +331,8 @@ func (client *fakeGitHubClient) GetPullRequest(_ context.Context, token, reposit
 	}, nil
 }
 
-func (client *fakeGitHubClient) GetWorkflowJob(_ context.Context, token, repository string, runID int64, jobName string) (githubapi.WorkflowJob, error) {
-	if token != "installation-token" || repository != "owner/project" || runID != 99 || jobName != "tooling" {
+func (client *fakeGitHubClient) GetWorkflowJob(_ context.Context, token, repository string, runID int64, runAttempt int, jobName string) (githubapi.WorkflowJob, error) {
+	if token != "installation-token" || repository != "owner/project" || runID != 99 || runAttempt != 1 || jobName != "tooling" {
 		return githubapi.WorkflowJob{}, io.ErrUnexpectedEOF
 	}
 	startedAt := time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)

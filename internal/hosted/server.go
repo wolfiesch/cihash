@@ -39,7 +39,7 @@ const (
 type GitHubClient interface {
 	InstallationToken(context.Context, int64, string) (string, error)
 	GetPullRequest(context.Context, string, string, int64) (githubapi.PullRequestState, error)
-	GetWorkflowJob(context.Context, string, string, int64, string) (githubapi.WorkflowJob, error)
+	GetWorkflowJob(context.Context, string, string, int64, int, string) (githubapi.WorkflowJob, error)
 	CreateCheckRun(context.Context, string, string, githubapp.CheckRunRequest) (int64, error)
 	UpdateCheckRun(context.Context, string, string, int64, githubapi.CheckRunUpdate) error
 	DispatchWorkflow(context.Context, string, string, string, githubapi.WorkflowDispatch) (int64, error)
@@ -728,7 +728,7 @@ func (server *Server) handleWorkflowRun(ctx context.Context, body []byte) error 
 		if err != nil {
 			return err
 		}
-		job, err := server.github.GetWorkflowJob(ctx, token, server.config.Repository, payload.WorkflowRun.ID, server.config.ShadowJob)
+		job, err := server.github.GetWorkflowJob(ctx, token, server.config.Repository, payload.WorkflowRun.ID, payload.WorkflowRun.RunAttempt, server.config.ShadowJob)
 		if err != nil {
 			return err
 		}

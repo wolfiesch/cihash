@@ -100,13 +100,13 @@ func TestCheckAndWorkflowRequestsUseInstallationToken(t *testing.T) {
 			}
 			response.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(response, `{"workflow_run_id":99}`)
-		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/project/actions/runs/99/jobs":
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/project/actions/runs/99/attempts/1/jobs":
 			jobSeen = true
-			if request.URL.Query().Get("filter") != "latest" || request.URL.Query().Get("per_page") != "100" {
+			if request.URL.RawQuery != "per_page=100" {
 				t.Fatalf("workflow jobs query = %q", request.URL.RawQuery)
 			}
 			response.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(response, `{"jobs":[{"id":101,"name":"tooling","status":"completed","conclusion":"success","started_at":"2026-07-20T12:00:00Z","completed_at":"2026-07-20T12:01:00Z"}]}`)
+			_, _ = io.WriteString(response, `{"jobs":[{"id":101,"run_attempt":1,"name":"tooling","status":"completed","conclusion":"success","started_at":"2026-07-20T12:00:00Z","completed_at":"2026-07-20T12:01:00Z"}]}`)
 		default:
 			http.Error(response, "unexpected request", http.StatusNotFound)
 		}
@@ -150,12 +150,34 @@ func TestCheckAndWorkflowRequestsUseInstallationToken(t *testing.T) {
 	if err != nil || runID != 99 {
 		t.Fatalf("DispatchWorkflow = %d, %v", runID, err)
 	}
-	job, err := client.GetWorkflowJob(context.Background(), "installation-token", "owner/project", runID, "tooling")
+	job, err := client.GetWorkflowJob(context.Background(), "installation-token", "owner/project", runID, 1, "tooling")
 	if err != nil || job.ID != 101 || job.Conclusion != "success" || job.CompletedAt.Sub(job.StartedAt) != time.Minute {
 		t.Fatalf("GetWorkflowJob = %+v, %v", job, err)
 	}
 	if !pullSeen || !mergeRefSeen || !mergeCommitSeen || !createSeen || !updateSeen || !dispatchSeen || !jobSeen {
 		t.Fatalf("requests seen: pull=%v mergeRef=%v mergeCommit=%v create=%v update=%v dispatch=%v job=%v", pullSeen, mergeRefSeen, mergeCommitSeen, createSeen, updateSeen, dispatchSeen, jobSeen)
+	}
+}
+
+func TestGetWorkflowJobRejectsDifferentAttempt(t *testing.T) {
+	privateKey := generateRSAKey(t)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet ||
+			request.URL.RequestURI() != "/repos/owner/project/actions/runs/99/attempts/1/jobs?per_page=100" {
+			http.Error(response, "unexpected request", http.StatusNotFound)
+			return
+		}
+		response.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(response, `{"jobs":[{"id":101,"run_attempt":2,"name":"tooling","status":"completed","conclusion":"success","started_at":"2026-07-20T12:00:00Z","completed_at":"2026-07-20T12:01:00Z"}]}`)
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "client-id", privateKey, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := client.GetWorkflowJob(context.Background(), "installation-token", "owner/project", 99, 1, "tooling")
+	if err == nil || !strings.Contains(err.Error(), "does not belong to requested attempt 1") || job.ID != 0 {
+		t.Fatalf("GetWorkflowJob = %+v, %v; want attempt mismatch", job, err)
 	}
 }
 
