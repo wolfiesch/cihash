@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +49,9 @@ func TestRunExecutesAuthoritativeMetadataFreeMergeTree(t *testing.T) {
 	expectedTree := git(t, repository, "merge-tree", "--write-tree", "--no-messages", baseSHA, headSHA)
 	if outcome.Result.TreeSHA != expectedTree {
 		t.Fatalf("tree = %s, want authoritative merge tree %s", outcome.Result.TreeSHA, expectedTree)
+	}
+	if len(outcome.Result.Jobs) != 1 || !slices.Equal(outcome.Result.Jobs[0].Command, grant.Policy.Command) {
+		t.Fatalf("receipt job command = %v, want %v", outcome.Result.Jobs, grant.Policy.Command)
 	}
 	if outcome.Result.Nonce != grant.Nonce || outcome.Result.Architecture != grant.Architecture || !outcome.Result.ExpiresAt.Equal(grant.ExpiresAt) {
 		t.Fatalf("receipt does not retain grant identity: %+v", outcome.Result)

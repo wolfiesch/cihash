@@ -6,7 +6,7 @@ Wants=network-online.target docker.service
 [Service]
 Type=simple
 ExecStartPre=-/usr/bin/docker rm -f cihash
-ExecStart=/usr/bin/docker run --name cihash --network agent-webhook-hub_web --user 997:987 --read-only --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=256 --memory=256m --cpus=1 --tmpfs /tmp:rw,noexec,nosuid,size=16m --env-file /srv/cihash/secrets/cihash.env --mount type=bind,src=/srv/cihash/config,dst=/srv/cihash/config,readonly --mount type=bind,src=/srv/cihash/secrets,dst=/srv/cihash/secrets,readonly --mount type=bind,src=/srv/cihash/receipts,dst=/srv/cihash/receipts --mount type=bind,src=/srv/cihash/state,dst=/srv/cihash/state sha256:cf63eeb113f915a8ff6a944d56249b62e3bc08b8fe05535851e35453288f83fc serve --config /srv/cihash/config/hosted.json
+ExecStart=/usr/bin/docker run --name cihash --network agent-webhook-hub_web --user 997:987 --read-only --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=256 --memory=256m --cpus=1 --tmpfs /tmp:rw,noexec,nosuid,size=16m --env-file /srv/cihash/secrets/cihash.env --mount type=bind,src=/srv/cihash/config,dst=/srv/cihash/config,readonly --mount type=bind,src=/srv/cihash/secrets,dst=/srv/cihash/secrets,readonly --mount type=bind,src=/srv/cihash/receipts,dst=/srv/cihash/receipts --mount type=bind,src=/srv/cihash/state,dst=/srv/cihash/state sha256:450b2762b38da0cd148a4ba248f8614c9757e2837624ec32b40287530e08f19c serve --config /srv/cihash/config/hosted.json
 ExecStop=/usr/bin/docker stop --time 10 cihash
 ExecStopPost=-/usr/bin/docker rm -f cihash
 Restart=on-failure

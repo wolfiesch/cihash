@@ -144,6 +144,7 @@ func Run(ctx context.Context, request Request) (Outcome, error) {
 		Architecture:      request.Grant.Architecture,
 		Jobs: []attestation.JobResult{{
 			Name:        request.Grant.Policy.Profile,
+			Command:     append([]string(nil), request.Grant.Policy.Command...),
 			ExitCode:    exitCode,
 			Conclusion:  conclusion,
 			StartedAt:   startedAt,
