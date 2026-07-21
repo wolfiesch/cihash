@@ -27,6 +27,7 @@ The App private key, webhook secret, and receipt-signing key are separate creden
   "listen": "127.0.0.1:8080",
   "webhookPath": "/webhooks/github",
   "repository": "owner/project",
+  "checkName": "cihash/verify",
   "policyFile": "./policy.json",
   "receiptPublicKeyFile": "./receipt-signing.pub.pem",
   "receiptStore": "./var/receipts",

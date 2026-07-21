@@ -1,0 +1,12 @@
+{
+  "listen": "0.0.0.0:18080",
+  "webhookPath": "/webhooks/github",
+  "repository": "pilot-org/pilot-repo",
+  "checkName": "cihash/tooling-offline",
+  "policyFile": "/srv/cihash/config/policy.json",
+  "receiptPublicKeyFile": "/srv/cihash/secrets/receipt-signing.pub.pem",
+  "receiptStore": "/srv/cihash/receipts",
+  "stateDirectory": "/srv/cihash/state",
+  "mode": "shadow",
+  "detailsUrl": "https://github.com/apps/cihash-t4-shadow"
+}

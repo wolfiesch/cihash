@@ -49,7 +49,7 @@ func TestPullRequestAcceptsExactProof(t *testing.T) {
 		t.Fatalf("created checks = %d, want 1", len(client.createdChecks))
 	}
 	check := client.createdChecks[0]
-	if check.Status != "completed" || check.Conclusion != "success" || check.HeadSHA != headSHA {
+	if check.Name != "cihash/tooling" || check.Status != "completed" || check.Conclusion != "success" || check.HeadSHA != headSHA {
 		t.Fatalf("check = %+v, want completed success", check)
 	}
 	if len(client.dispatches) != 0 {
@@ -63,7 +63,7 @@ func TestMissingProofDispatchesAndCompletesFallback(t *testing.T) {
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	if len(client.createdChecks) != 1 || client.createdChecks[0].Status != "queued" {
+	if len(client.createdChecks) != 1 || client.createdChecks[0].Name != "cihash/tooling" || client.createdChecks[0].Status != "queued" {
 		t.Fatalf("created checks = %+v, want one queued check", client.createdChecks)
 	}
 	if len(client.dispatches) != 1 {
@@ -107,12 +107,51 @@ func TestMissingProofDispatchesAndCompletesFallback(t *testing.T) {
 		t.Fatalf("updated checks = %d, want 1", len(client.updatedChecks))
 	}
 	update := client.updatedChecks[0]
-	if update.Status != "completed" || update.Conclusion != "success" || update.checkRunID != 42 {
+	if update.Name != "cihash/tooling" || update.Status != "completed" || update.Conclusion != "success" || update.checkRunID != 42 {
 		t.Fatalf("update = %+v, want completed success for check 42", update)
 	}
 	state, found, err = server.stateStore.LookupWorkflowRun(99)
 	if err != nil || !found || state.CompletedAt == nil || state.Conclusion != "success" {
 		t.Fatalf("completed state = %+v, %v, %v", state, found, err)
+	}
+}
+func TestFallbackDispatchFailureKeepsConfiguredCheckName(t *testing.T) {
+	server, client, secret, headSHA, baseSHA := hostedFixture(t, githubapp.EnforceMode, false)
+	client.dispatchErr = io.ErrClosedPipe
+
+	response := sendWebhook(t, server, secret, "pull_request", "delivery-dispatch-failure", pullRequestBody(headSHA, baseSHA))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if len(client.updatedChecks) != 1 {
+		t.Fatalf("updated checks = %d, want 1", len(client.updatedChecks))
+	}
+	update := client.updatedChecks[0]
+	if update.Name != "cihash/tooling" || update.Status != "completed" || update.Conclusion != "action_required" || update.checkRunID != 42 {
+		t.Fatalf("update = %+v, want configured completed action_required check 42", update)
+	}
+}
+
+func TestConfigRejectsConflictingWebhookPaths(t *testing.T) {
+	base := Config{
+		WebhookPath:          "/webhooks/github",
+		Repository:           "owner/project",
+		CheckName:            "cihash/tooling",
+		PolicyFile:           "policy.json",
+		ReceiptPublicKeyFile: "receipt.pub",
+		ReceiptStore:         "receipts",
+		StateDirectory:       "state",
+		Mode:                 githubapp.ShadowMode,
+	}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("default webhook path rejected: %v", err)
+	}
+	for _, webhookPath := range []string{"/health", "/", "/webhooks/../health", "/webhooks/{event}", "/webhooks/github?event=pull_request"} {
+		configured := base
+		configured.WebhookPath = webhookPath
+		if err := configured.Validate(); err == nil {
+			t.Fatalf("webhook path %q was accepted", webhookPath)
+		}
 	}
 }
 
@@ -121,6 +160,7 @@ type fakeGitHubClient struct {
 	createdChecks []githubapp.CheckRunRequest
 	updatedChecks []recordedUpdate
 	dispatches    []recordedDispatch
+	dispatchErr   error
 }
 
 type recordedUpdate struct {
@@ -174,6 +214,9 @@ func (client *fakeGitHubClient) DispatchWorkflow(_ context.Context, token, repos
 		return 0, io.ErrUnexpectedEOF
 	}
 	client.dispatches = append(client.dispatches, recordedDispatch{workflow: workflow, request: request})
+	if client.dispatchErr != nil {
+		return 0, client.dispatchErr
+	}
 	return 99, nil
 }
 
@@ -197,6 +240,7 @@ func hostedFixture(t *testing.T, mode githubapp.Mode, withProof bool) (*Server, 
 		Listen:               "127.0.0.1:0",
 		WebhookPath:          "/webhooks/github",
 		Repository:           "owner/project",
+		CheckName:            "cihash/tooling",
 		PolicyFile:           root + "/policy.json",
 		ReceiptPublicKeyFile: root + "/receipt.pub",
 		ReceiptStore:         root + "/receipts",

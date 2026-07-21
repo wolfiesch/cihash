@@ -42,8 +42,11 @@ func (s Store) Save(identity Identity, envelope attestation.Envelope, log []byte
 	receiptID := digest(envelopeData)
 	receiptsDir := filepath.Join(s.root, "receipts")
 	logsDir := filepath.Join(s.root, "logs")
-	if err := os.MkdirAll(receiptsDir, 0o700); err != nil {
+	if err := os.MkdirAll(receiptsDir, 0o750); err != nil {
 		return "", "", fmt.Errorf("create receipt directory: %w", err)
+	}
+	if err := os.Chmod(receiptsDir, 0o750|os.ModeSetgid); err != nil {
+		return "", "", fmt.Errorf("set receipt directory mode: %w", err)
 	}
 	if err := os.MkdirAll(logsDir, 0o700); err != nil {
 		return "", "", fmt.Errorf("create log directory: %w", err)
@@ -53,7 +56,7 @@ func (s Store) Save(identity Identity, envelope attestation.Envelope, log []byte
 	if err := atomicWrite(logPath, log, 0o600); err != nil {
 		return "", "", err
 	}
-	if err := atomicWrite(receiptPath, envelopeData, 0o600); err != nil {
+	if err := atomicWrite(receiptPath, envelopeData, 0o640); err != nil {
 		return "", "", err
 	}
 	return receiptPath, logPath, nil

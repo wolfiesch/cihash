@@ -289,6 +289,7 @@ func containerExecCommand(arguments []string, output io.Writer) *commandError {
 	network := flags.String("network", "none", "container network: none or bridge")
 	memory := flags.String("memory", "8g", "container memory limit")
 	cpus := flags.String("cpus", "6", "container CPU limit")
+	pidsLimit := flags.Int("pids-limit", containerexec.DefaultPIDsLimit, "container PID limit")
 	if err := flags.Parse(arguments); err != nil {
 		return usageError(err)
 	}
@@ -306,6 +307,7 @@ func containerExecCommand(arguments []string, output io.Writer) *commandError {
 		Network:   *network,
 		Memory:    *memory,
 		CPUs:      *cpus,
+		PIDsLimit: *pidsLimit,
 		Command:   flags.Args(),
 		Directory: directory,
 	})

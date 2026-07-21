@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strings"
 
@@ -16,6 +17,7 @@ type Config struct {
 	Listen               string         `json:"listen"`
 	WebhookPath          string         `json:"webhookPath"`
 	Repository           string         `json:"repository"`
+	CheckName            string         `json:"checkName"`
 	PolicyFile           string         `json:"policyFile"`
 	ReceiptPublicKeyFile string         `json:"receiptPublicKeyFile"`
 	ReceiptStore         string         `json:"receiptStore"`
@@ -55,6 +57,9 @@ func (configured *Config) applyDefaults() {
 	if configured.WebhookPath == "" {
 		configured.WebhookPath = "/webhooks/github"
 	}
+	if configured.CheckName == "" {
+		configured.CheckName = githubapp.CheckName
+	}
 	if configured.GitHubAPIBaseURL == "" {
 		configured.GitHubAPIBaseURL = "https://api.github.com"
 	}
@@ -75,8 +80,11 @@ func (configured Config) Validate() error {
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return fmt.Errorf("hosted repository must be owner/name")
 	}
-	if configured.WebhookPath == "" || configured.WebhookPath[0] != '/' {
-		return fmt.Errorf("webhookPath must start with /")
+	if strings.TrimSpace(configured.CheckName) != configured.CheckName || !strings.HasPrefix(configured.CheckName, "cihash/") || len(configured.CheckName) > 100 {
+		return fmt.Errorf("checkName must start with cihash/, contain no surrounding whitespace, and be at most 100 characters")
+	}
+	if !validWebhookPath(configured.WebhookPath) {
+		return fmt.Errorf("webhookPath must be a clean literal path distinct from /health")
 	}
 	if configured.PolicyFile == "" || configured.ReceiptPublicKeyFile == "" || configured.ReceiptStore == "" || configured.StateDirectory == "" {
 		return fmt.Errorf("policyFile, receiptPublicKeyFile, receiptStore, and stateDirectory are required")
@@ -93,6 +101,24 @@ func (configured Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func validWebhookPath(value string) bool {
+	if value == "/" || value == "/health" || !strings.HasPrefix(value, "/") || pathpkg.Clean(value) != value {
+		return false
+	}
+	for index := 1; index < len(value); index++ {
+		character := value[index]
+		if (character >= 'a' && character <= 'z') ||
+			(character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') ||
+			character == '/' || character == '-' || character == '_' ||
+			character == '.' || character == '~' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func resolvePath(base, path string) string {

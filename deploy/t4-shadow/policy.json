@@ -1,0 +1,22 @@
+{
+  "version": "0.1",
+  "repository": "github.com/pilot-org/pilot-repo",
+  "profile": "t4-tooling-offline",
+  "command": [
+    "/srv/cihash/bin/cihash",
+    "container-exec",
+    "--image",
+    "sha256:8fdc397e0dfa64f1418aae9d707d5d093e0ffc695a360913434761f642a152e3",
+    "--network",
+    "none",
+    "--memory",
+    "12g",
+    "--cpus",
+    "6",
+    "--",
+    "/usr/local/bin/cihash-t4-tooling"
+  ],
+  "environment": "oci://docker.io/library/cihash-t4-tooling@sha256:8fdc397e0dfa64f1418aae9d707d5d093e0ffc695a360913434761f642a152e3 linux/amd64 network=none memory=12g cpus=6 pids=1024",
+  "maxAgeSeconds": 3600,
+  "timeoutSeconds": 1800
+}

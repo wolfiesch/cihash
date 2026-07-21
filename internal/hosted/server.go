@@ -223,6 +223,7 @@ func (server *Server) handlePullRequest(ctx context.Context, body []byte) error 
 		return err
 	}
 	decision := githubapp.Evaluate(server.receiptStore, server.publicKey, expected, server.config.Mode)
+	decision.CheckRun.Name = server.config.CheckName
 	if server.config.DetailsURL != "" {
 		decision.CheckRun.DetailsURL = server.config.DetailsURL
 	}
@@ -284,7 +285,7 @@ func (server *Server) dispatchFallback(ctx context.Context, token string, payloa
 func (server *Server) failFallbackDispatch(ctx context.Context, token string, state FallbackState, cause error) error {
 	now := server.now()
 	update := githubapi.CheckRunUpdate{
-		Name:        githubapp.CheckName,
+		Name:        server.config.CheckName,
 		Status:      "completed",
 		Conclusion:  "action_required",
 		ExternalID:  state.ExternalID,
@@ -332,7 +333,7 @@ func (server *Server) handleWorkflowRun(ctx context.Context, body []byte) error 
 		completedAt = server.now()
 	}
 	update := githubapi.CheckRunUpdate{
-		Name:        githubapp.CheckName,
+		Name:        server.config.CheckName,
 		Status:      "completed",
 		Conclusion:  conclusion,
 		ExternalID:  state.ExternalID,
