@@ -63,7 +63,7 @@ func TestInstallationTokenUsesValidAppJWTAndRepositoryScope(t *testing.T) {
 
 func TestCheckAndWorkflowRequestsUseInstallationToken(t *testing.T) {
 	privateKey := generateRSAKey(t)
-	var createSeen, updateSeen, dispatchSeen, pullSeen, mergeCommitSeen, jobSeen bool
+	var createSeen, updateSeen, dispatchSeen, pullSeen, mergeRefSeen, mergeCommitSeen, jobSeen bool
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.Header.Get("Authorization") != "Bearer installation-token" {
 			t.Fatalf("authorization = %q", request.Header.Get("Authorization"))
@@ -72,11 +72,15 @@ func TestCheckAndWorkflowRequestsUseInstallationToken(t *testing.T) {
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/project/pulls/7":
 			pullSeen = true
 			response.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(response, `{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repo":{"full_name":"owner/project"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main"},"merge_commit_sha":"cccccccccccccccccccccccccccccccccccccccc"}`)
+			_, _ = io.WriteString(response, `{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repo":{"full_name":"owner/project"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main"}}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/project/git/ref/pull/7/merge":
+			mergeRefSeen = true
+			response.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(response, `{"object":{"type":"commit","sha":"cccccccccccccccccccccccccccccccccccccccc"}}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/project/git/commits/cccccccccccccccccccccccccccccccccccccccc":
 			mergeCommitSeen = true
 			response.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(response, `{"tree":{"sha":"dddddddddddddddddddddddddddddddddddddddd"}}`)
+			_, _ = io.WriteString(response, `{"tree":{"sha":"dddddddddddddddddddddddddddddddddddddddd"},"parents":[{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}`)
 		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/project/check-runs":
 			createSeen = true
 			response.WriteHeader(http.StatusCreated)
@@ -150,8 +154,8 @@ func TestCheckAndWorkflowRequestsUseInstallationToken(t *testing.T) {
 	if err != nil || job.ID != 101 || job.Conclusion != "success" || job.CompletedAt.Sub(job.StartedAt) != time.Minute {
 		t.Fatalf("GetWorkflowJob = %+v, %v", job, err)
 	}
-	if !pullSeen || !mergeCommitSeen || !createSeen || !updateSeen || !dispatchSeen || !jobSeen {
-		t.Fatalf("requests seen: pull=%v mergeCommit=%v create=%v update=%v dispatch=%v job=%v", pullSeen, mergeCommitSeen, createSeen, updateSeen, dispatchSeen, jobSeen)
+	if !pullSeen || !mergeRefSeen || !mergeCommitSeen || !createSeen || !updateSeen || !dispatchSeen || !jobSeen {
+		t.Fatalf("requests seen: pull=%v mergeRef=%v mergeCommit=%v create=%v update=%v dispatch=%v job=%v", pullSeen, mergeRefSeen, mergeCommitSeen, createSeen, updateSeen, dispatchSeen, jobSeen)
 	}
 }
 
@@ -161,55 +165,92 @@ func TestGetPullRequestFailsClosedWithoutAuthoritativeMergeTree(t *testing.T) {
 		baseSHA        = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 		mergeCommitSHA = "cccccccccccccccccccccccccccccccccccccccc"
 	)
+	validPull := `{"head":{"sha":"` + headSHA + `","repo":{"full_name":"owner/project"}},"base":{"sha":"` + baseSHA + `","ref":"main"}}`
+	validRef := `{"object":{"type":"commit","sha":"` + mergeCommitSHA + `"}}`
+	validParents := `"parents":[{"sha":"` + baseSHA + `"},{"sha":"` + headSHA + `"}]`
 	tests := []struct {
 		name       string
 		pullBody   string
+		refBody    string
+		refCode    int
 		commitBody string
 		commitCode int
+		wantRef    bool
+		wantCommit bool
 		wantError  string
 	}{
 		{
-			name:      "missing merge commit",
-			pullBody:  `{"head":{"sha":"` + headSHA + `","repo":{"full_name":"owner/project"}},"base":{"sha":"` + baseSHA + `","ref":"main"}}`,
-			wantError: "GitHub has no merge commit",
-		},
-		{
 			name:      "malformed pull request identity",
-			pullBody:  `{"head":{"sha":"not-a-git-object","repo":{"full_name":"owner/project"}},"base":{"sha":"` + baseSHA + `","ref":"main"},"merge_commit_sha":"` + mergeCommitSHA + `"}`,
+			pullBody:  `{"head":{"sha":"not-a-git-object","repo":{"full_name":"owner/project"}},"base":{"sha":"` + baseSHA + `","ref":"main"}}`,
 			wantError: "GitHub returned malformed pull request identity",
 		},
 		{
-			name:      "malformed merge commit",
-			pullBody:  `{"head":{"sha":"` + headSHA + `","repo":{"full_name":"owner/project"}},"base":{"sha":"` + baseSHA + `","ref":"main"},"merge_commit_sha":"not-a-git-object"}`,
-			wantError: "GitHub returned malformed pull request merge commit SHA",
+			name:      "merge ref unavailable",
+			pullBody:  validPull,
+			refCode:   http.StatusServiceUnavailable,
+			wantRef:   true,
+			wantError: "fetch GitHub pull request merge ref",
+		},
+		{
+			name:      "malformed merge ref",
+			pullBody:  validPull,
+			refBody:   `{"object":{"type":"commit","sha":"not-a-git-object"}}`,
+			wantRef:   true,
+			wantError: "GitHub returned malformed pull request merge ref",
 		},
 		{
 			name:       "merge commit unavailable",
-			pullBody:   `{"head":{"sha":"` + headSHA + `","repo":{"full_name":"owner/project"}},"base":{"sha":"` + baseSHA + `","ref":"main"},"merge_commit_sha":"` + mergeCommitSHA + `"}`,
+			pullBody:   validPull,
+			refBody:    validRef,
 			commitCode: http.StatusServiceUnavailable,
+			wantRef:    true,
+			wantCommit: true,
 			wantError:  "fetch GitHub pull request merge commit",
 		},
 		{
+			name:       "merge commit parents do not match pull request",
+			pullBody:   validPull,
+			refBody:    validRef,
+			commitBody: `{"tree":{"sha":"dddddddddddddddddddddddddddddddddddddddd"},"parents":[{"sha":"` + headSHA + `"},{"sha":"` + baseSHA + `"}]}`,
+			wantRef:    true,
+			wantCommit: true,
+			wantError:  "merge ref does not match current base and head",
+		},
+		{
 			name:       "missing merge tree",
-			pullBody:   `{"head":{"sha":"` + headSHA + `","repo":{"full_name":"owner/project"}},"base":{"sha":"` + baseSHA + `","ref":"main"},"merge_commit_sha":"` + mergeCommitSHA + `"}`,
-			commitBody: `{"tree":{}}`,
+			pullBody:   validPull,
+			refBody:    validRef,
+			commitBody: `{"tree":{},` + validParents + `}`,
+			wantRef:    true,
+			wantCommit: true,
 			wantError:  "GitHub returned no tree SHA",
 		},
 		{
 			name:       "malformed merge tree",
-			pullBody:   `{"head":{"sha":"` + headSHA + `","repo":{"full_name":"owner/project"}},"base":{"sha":"` + baseSHA + `","ref":"main"},"merge_commit_sha":"` + mergeCommitSHA + `"}`,
-			commitBody: `{"tree":{"sha":"not-a-git-object"}}`,
+			pullBody:   validPull,
+			refBody:    validRef,
+			commitBody: `{"tree":{"sha":"not-a-git-object"},` + validParents + `}`,
+			wantRef:    true,
+			wantCommit: true,
 			wantError:  "GitHub returned malformed pull request merge tree SHA",
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			commitRequested := false
+			var refRequested, commitRequested bool
 			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 				switch request.URL.Path {
 				case "/repos/owner/project/pulls/7":
 					response.WriteHeader(http.StatusOK)
 					_, _ = io.WriteString(response, test.pullBody)
+				case "/repos/owner/project/git/ref/pull/7/merge":
+					refRequested = true
+					if test.refCode != 0 {
+						http.Error(response, "unavailable", test.refCode)
+						return
+					}
+					response.WriteHeader(http.StatusOK)
+					_, _ = io.WriteString(response, test.refBody)
 				case "/repos/owner/project/git/commits/" + mergeCommitSHA:
 					commitRequested = true
 					if test.commitCode != 0 {
@@ -230,8 +271,8 @@ func TestGetPullRequestFailsClosedWithoutAuthoritativeMergeTree(t *testing.T) {
 			if _, err := client.GetPullRequest(context.Background(), "installation-token", "owner/project", 7); err == nil || !strings.Contains(err.Error(), test.wantError) {
 				t.Fatalf("GetPullRequest error = %v, want %q", err, test.wantError)
 			}
-			if (test.commitBody != "" || test.commitCode != 0) != commitRequested {
-				t.Fatalf("merge commit requested = %v", commitRequested)
+			if refRequested != test.wantRef || commitRequested != test.wantCommit {
+				t.Fatalf("requests: ref=%v commit=%v, want ref=%v commit=%v", refRequested, commitRequested, test.wantRef, test.wantCommit)
 			}
 		})
 	}

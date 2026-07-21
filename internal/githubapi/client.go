@@ -159,7 +159,6 @@ func (client *Client) GetPullRequest(ctx context.Context, token, repository stri
 			SHA string `json:"sha"`
 			Ref string `json:"ref"`
 		} `json:"base"`
-		MergeCommitSHA string `json:"merge_commit_sha"`
 	}
 	path := "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/pulls/" + strconv.FormatInt(number, 10)
 	if err := client.do(ctx, http.MethodGet, path, token, nil, http.StatusOK, &response); err != nil {
@@ -171,20 +170,35 @@ func (client *Client) GetPullRequest(ctx context.Context, token, repository stri
 	if !validGitObjectID(response.Head.SHA) || !validGitObjectID(response.Base.SHA) {
 		return PullRequestState{}, fmt.Errorf("GitHub returned malformed pull request identity")
 	}
-	if response.MergeCommitSHA == "" {
-		return PullRequestState{}, fmt.Errorf("GitHub has no merge commit for pull request")
+	var mergeRef struct {
+		Object struct {
+			Type string `json:"type"`
+			SHA  string `json:"sha"`
+		} `json:"object"`
 	}
-	if !validGitObjectID(response.MergeCommitSHA) {
-		return PullRequestState{}, fmt.Errorf("GitHub returned malformed pull request merge commit SHA")
+	mergeRefPath := "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/git/ref/pull/" + strconv.FormatInt(number, 10) + "/merge"
+	if err := client.do(ctx, http.MethodGet, mergeRefPath, token, nil, http.StatusOK, &mergeRef); err != nil {
+		return PullRequestState{}, fmt.Errorf("fetch GitHub pull request merge ref: %w", err)
+	}
+	if mergeRef.Object.Type != "commit" || !validGitObjectID(mergeRef.Object.SHA) {
+		return PullRequestState{}, fmt.Errorf("GitHub returned malformed pull request merge ref")
 	}
 	var mergeCommit struct {
 		Tree struct {
 			SHA string `json:"sha"`
 		} `json:"tree"`
+		Parents []struct {
+			SHA string `json:"sha"`
+		} `json:"parents"`
 	}
-	mergeCommitPath := "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/git/commits/" + url.PathEscape(response.MergeCommitSHA)
+	mergeCommitPath := "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/git/commits/" + url.PathEscape(mergeRef.Object.SHA)
 	if err := client.do(ctx, http.MethodGet, mergeCommitPath, token, nil, http.StatusOK, &mergeCommit); err != nil {
 		return PullRequestState{}, fmt.Errorf("fetch GitHub pull request merge commit: %w", err)
+	}
+	if len(mergeCommit.Parents) != 2 ||
+		!strings.EqualFold(mergeCommit.Parents[0].SHA, response.Base.SHA) ||
+		!strings.EqualFold(mergeCommit.Parents[1].SHA, response.Head.SHA) {
+		return PullRequestState{}, fmt.Errorf("GitHub pull request merge ref does not match current base and head")
 	}
 	if mergeCommit.Tree.SHA == "" {
 		return PullRequestState{}, fmt.Errorf("GitHub returned no tree SHA for pull request merge commit")
