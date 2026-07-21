@@ -47,13 +47,20 @@ required check:
 - `trust-quorum` proves distinct trusted Ed25519 keys can enforce a threshold
   over one exact receipt while duplicate signatures, spoofed key IDs, stale
   bases, tampering, and ordinary claim mismatches still fail closed;
-- `applicability` maps exact-commit, moving-base, and merge-group reuse and makes
-  the missing tree-only execution boundary explicit;
+- `applicability` maps exact-commit, moving-base, and merge-group reuse against
+  immutable tree identities;
 - `confirmer` proves two receipts with different clocks and nonces can be
   compared honestly through a 2-of-2 agreement bound to approved receipt keys,
-  domain names, and both canonical evidence-envelope digests.
+  domain names, and both canonical evidence-envelope digests;
+- `tree-isolation` materializes a metadata-free Git tree and verifies every
+  tracked path, blob identity, byte size, and executable mode against
+  `git ls-tree`; it rejects commit IDs, `.git` paths, escaping symlinks, resource
+  limit violations, gitlinks, and archive omissions or transformations.
 
-These experiments establish representational feasibility, not hosted
-authorization or market demand. They narrow the next product questions to
-independent trust-domain execution, immutable GitHub-state resolution,
-evidence lifecycle, producer conformance, and measurable avoided CI latency.
+These experiments establish representational and source-materialization
+feasibility, not hosted authorization, workload isolation, or market demand.
+The tree-only source is not yet connected to the runner, and repositories that
+need submodules or `git archive` export attributes deliberately fall back. The
+remaining product questions are independent trust-domain execution, immutable
+GitHub-state resolution, evidence lifecycle, producer conformance, and
+measurable avoided CI latency.

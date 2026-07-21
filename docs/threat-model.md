@@ -43,7 +43,13 @@ A signature proves who made a claim. Isolation and policy determine whether that
 
 ## Development runner limitation
 
-The initial local runner executes an archived committed tree as a child process. It proves the receipt and policy mechanics, but it is not a production trust boundary: the child shares the host user and kernel with the supervisor. Production enforcement requires an ephemeral VM or hardened container whose workload cannot inspect the supervisor or signing service.
+The initial local runner executes a clean committed tree as a child process, but
+its checkout still includes Git metadata. The separate `tree-isolation` lab can
+materialize and verify a metadata-free tree; it is not yet the runner's source
+path. Neither mechanism is a production trust boundary: the workload shares the
+host user and kernel with the supervisor. Production enforcement requires an
+ephemeral VM or hardened container whose workload cannot inspect the supervisor
+or signing service.
 
 ## Unsupported trust claims
 

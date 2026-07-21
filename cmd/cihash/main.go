@@ -416,8 +416,9 @@ func serveCommand(arguments []string, output io.Writer) *commandError {
 }
 
 func labCommand(arguments []string, output io.Writer) *commandError {
+	const usage = "usage: cihash lab <trust-quorum|applicability|confirmer|tree-isolation>"
 	if len(arguments) != 1 {
-		return usageError(errors.New("usage: cihash lab <trust-quorum|applicability|confirmer>"))
+		return usageError(errors.New(usage))
 	}
 
 	var (
@@ -431,8 +432,10 @@ func labCommand(arguments []string, output io.Writer) *commandError {
 		report, err = lab.RunApplicability()
 	case "confirmer":
 		report, err = lab.RunConfirmer()
+	case "tree-isolation":
+		report, err = lab.RunTreeIsolation()
 	default:
-		return usageError(errors.New("usage: cihash lab <trust-quorum|applicability|confirmer>"))
+		return usageError(errors.New(usage))
 	}
 	if err != nil {
 		return operationalError(err)
