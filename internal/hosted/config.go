@@ -101,8 +101,8 @@ func (configured Config) Validate() error {
 	if configured.Mode != githubapp.ShadowMode && configured.Mode != githubapp.EnforceMode {
 		return fmt.Errorf("hosted mode must be shadow or enforce")
 	}
-	if strings.TrimSpace(configured.BuildMode) != configured.BuildMode {
-		return fmt.Errorf("buildMode must not contain surrounding whitespace")
+	if configured.BuildMode != "" && configured.BuildMode != "development" && configured.BuildMode != "production" {
+		return fmt.Errorf("buildMode must be development or production")
 	}
 	if strings.TrimSpace(configured.ShadowWorkflow) != configured.ShadowWorkflow {
 		return fmt.Errorf("shadowWorkflow must not contain surrounding whitespace")

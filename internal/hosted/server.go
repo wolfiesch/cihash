@@ -138,6 +138,11 @@ func NewServer(config Config, webhookSecret, producerToken []byte, configuredPol
 	if err != nil {
 		return nil, err
 	}
+	if config.BuildMode == "production" {
+		if err := build.validateProduction(); err != nil {
+			return nil, err
+		}
+	}
 	startedAt := time.Now().UTC()
 	return &Server{
 		config:        config,

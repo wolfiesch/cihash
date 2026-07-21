@@ -94,7 +94,9 @@ print it, commit it, or expose it to a workload container.
 Build the Linux service binary and immutable service image:
 
 ```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /tmp/cihash-linux-amd64 ./cmd/cihash
+revision=$(git rev-parse HEAD)
+test -z "$(git status --porcelain)"
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=true -trimpath -ldflags="-s -w -X github.com/wolfiesch/cihash/internal/hosted.buildSourceRevision=$revision -X github.com/wolfiesch/cihash/internal/hosted.buildSourceModified=false" -o /tmp/cihash-linux-amd64 ./cmd/cihash
 scp /tmp/cihash-linux-amd64 deploy/t4-shadow/service.Dockerfile <runner-host>:/tmp/
 ssh <runner-host> 'sudo install -o cihash -g cihash -m 0755 /tmp/cihash-linux-amd64 /srv/cihash/service-context/cihash && sudo install -o cihash -g cihash -m 0644 /tmp/service.Dockerfile /srv/cihash/service-context/Dockerfile && sudo docker build --tag cihash-service:shadow /srv/cihash/service-context'
 ```
