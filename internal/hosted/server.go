@@ -314,6 +314,7 @@ func (server *Server) handleReceipt(response http.ResponseWriter, request *http.
 	}
 	decision := verifier.Verify(submission.Envelope, server.publicKey, expected)
 	if !decision.Accepted && decision.Code != "job_failed" && decision.Code != "proof_failed" {
+		server.logger.Printf("reject run %s receipt: %s: %s", runID, decision.Code, decision.Message)
 		http.Error(response, "receipt verification failed", http.StatusUnprocessableEntity)
 		return
 	}
