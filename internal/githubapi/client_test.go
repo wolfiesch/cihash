@@ -18,7 +18,7 @@ import (
 	"github.com/wolfiesch/cihash/internal/githubapp"
 )
 
-func TestInstallationTokenUsesValidAppJWTAndScopedPermissions(t *testing.T) {
+func TestInstallationTokenUsesValidAppJWTAndRepositoryScope(t *testing.T) {
 	privateKey := generateRSAKey(t)
 	fixedNow := time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
@@ -37,13 +37,11 @@ func TestInstallationTokenUsesValidAppJWTAndScopedPermissions(t *testing.T) {
 		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
-		if len(body.Repositories) != 1 || body.Repositories[0] != "project" ||
-			len(body.Permissions) != 4 ||
-			body.Permissions["actions"] != "write" ||
-			body.Permissions["checks"] != "write" ||
-			body.Permissions["contents"] != "read" ||
-			body.Permissions["pull_requests"] != "read" {
-			t.Fatalf("installation scope = %+v", body)
+		if len(body.Repositories) != 1 || body.Repositories[0] != "project" {
+			t.Fatalf("repositories = %v", body.Repositories)
+		}
+		if body.Permissions != nil {
+			t.Fatalf("permissions = %v, want installation defaults", body.Permissions)
 		}
 		response.WriteHeader(http.StatusCreated)
 		_, _ = io.WriteString(response, `{"token":"installation-token"}`)

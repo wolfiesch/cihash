@@ -5,9 +5,12 @@
 Create a GitHub App with these repository permissions:
 
 - Checks: read and write
+- Contents: read
 - Actions: read and write
 - Pull requests: read
 - Metadata: read
+
+Installation tokens are narrowed to the configured pilot repository and inherit the permissions accepted for that installation. Keep the App itself limited to the list above; CIHash does not request a broader token permission set.
 
 Subscribe the App webhook to:
 

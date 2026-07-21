@@ -123,16 +123,9 @@ func (client *Client) InstallationToken(ctx context.Context, installationID int6
 		return "", err
 	}
 	request := struct {
-		Repositories []string          `json:"repositories"`
-		Permissions  map[string]string `json:"permissions"`
+		Repositories []string `json:"repositories"`
 	}{
 		Repositories: []string{repositoryName},
-		Permissions: map[string]string{
-			"contents":      "read",
-			"actions":       "write",
-			"checks":        "write",
-			"pull_requests": "read",
-		},
 	}
 	var response struct {
 		Token string `json:"token"`

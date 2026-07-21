@@ -69,6 +69,7 @@ Configure the App with:
 - Webhook active at `https://cihash.wolfie.gg/webhooks/github`
 - Repository permissions:
   - Actions: read and write
+  - Contents: read-only
   - Checks: read and write
   - Pull requests: read-only
   - Metadata: read-only
