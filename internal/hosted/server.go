@@ -87,6 +87,7 @@ type workflowRunPayload struct {
 	WorkflowRun  struct {
 		ID           int64     `json:"id"`
 		Event        string    `json:"event"`
+		RunAttempt   int       `json:"run_attempt"`
 		Status       string    `json:"status"`
 		Conclusion   string    `json:"conclusion"`
 		HeadBranch   string    `json:"head_branch"`
@@ -94,6 +95,15 @@ type workflowRunPayload struct {
 		Name         string    `json:"name"`
 		RunStartedAt time.Time `json:"run_started_at"`
 		UpdatedAt    time.Time `json:"updated_at"`
+		PullRequests []struct {
+			Number int64 `json:"number"`
+			Head   struct {
+				SHA string `json:"sha"`
+			} `json:"head"`
+			Base struct {
+				SHA string `json:"sha"`
+			} `json:"base"`
+		} `json:"pull_requests"`
 	} `json:"workflow_run"`
 }
 
@@ -690,11 +700,28 @@ func (server *Server) handleWorkflowRun(ctx context.Context, body []byte) error 
 		if server.config.ShadowWorkflow == "" || payload.WorkflowRun.Name != server.config.ShadowWorkflow {
 			return nil
 		}
+		if payload.WorkflowRun.Event != "pull_request" || payload.WorkflowRun.RunAttempt != 1 {
+			return nil
+		}
 		if payload.Repository.FullName != server.config.Repository {
 			return nil
 		}
 		if payload.Installation.ID <= 0 {
 			return fmt.Errorf("workflow_run webhook is missing installation identity")
+		}
+		var pullRequestNumber int64
+		var baseSHA string
+		for _, pullRequest := range payload.WorkflowRun.PullRequests {
+			if pullRequest.Number > 0 && pullRequest.Head.SHA == payload.WorkflowRun.HeadSHA && pullRequest.Base.SHA != "" {
+				if pullRequestNumber != 0 {
+					return nil
+				}
+				pullRequestNumber = pullRequest.Number
+				baseSHA = pullRequest.Base.SHA
+			}
+		}
+		if pullRequestNumber == 0 {
+			return nil
 		}
 		token, err := server.github.InstallationToken(ctx, payload.Installation.ID, server.config.Repository)
 		if err != nil {
@@ -705,12 +732,16 @@ func (server *Server) handleWorkflowRun(ctx context.Context, body []byte) error 
 			return err
 		}
 		_, _, err = server.shadowStore.RecordWorkflow(server.config.Repository, shadow.Workflow{
-			Name:        job.Name,
-			RunID:       payload.WorkflowRun.ID,
-			HeadSHA:     payload.WorkflowRun.HeadSHA,
-			Conclusion:  job.Conclusion,
-			StartedAt:   job.StartedAt,
-			CompletedAt: job.CompletedAt,
+			Name:              job.Name,
+			RunID:             payload.WorkflowRun.ID,
+			HeadSHA:           payload.WorkflowRun.HeadSHA,
+			PullRequestNumber: pullRequestNumber,
+			BaseSHA:           baseSHA,
+			Event:             payload.WorkflowRun.Event,
+			RunAttempt:        payload.WorkflowRun.RunAttempt,
+			Conclusion:        job.Conclusion,
+			StartedAt:         job.StartedAt,
+			CompletedAt:       job.CompletedAt,
 		})
 		if err != nil {
 			return fmt.Errorf("record shadow workflow: %w", err)

@@ -32,7 +32,7 @@ A signature proves who made a claim. Isolation and policy determine whether that
 | Receipt replayed for different code | Bind repository, head, base, merge tree, policy, workflow, environment, nonce, and expiry into the signed predicate. |
 | Repository weakens its own test command | Store or approve policy outside the submitted tree; bind the approved policy digest. |
 | Base changes after verification | Bind the exact base SHA and reject when the pull request base differs. |
-| Repository-local Git replacement metadata changes resolved objects | Disable Git replacement and process-level object/config overrides for every trusted Git command, then compare the signed tree to the merge-commit tree independently resolved through GitHub. |
+| Repository-local Git metadata executes host commands or changes resolved objects | Resolve commits with a Git environment whitelist, compute merges in a fresh bare repository with an empty template and temporary object output, expose the source repository only as an alternate object database, disable replacement/config/process overrides, and compare the signed tree to the merge-commit tree independently resolved through GitHub. |
 | Required matrix job omitted | Bind the complete approved job set and require every job to succeed. |
 | Mutable dependency or fixture changes | Pin or digest every accepted input; otherwise reject reuse and run fallback CI. |
 | Another actor spoofs the status name | Require the check from the CIHash GitHub App as its source. |

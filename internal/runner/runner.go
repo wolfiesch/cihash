@@ -50,11 +50,12 @@ func Run(ctx context.Context, request Request) (Outcome, error) {
 	if !strings.EqualFold(headSHA, request.Grant.HeadSHA) || !strings.EqualFold(baseSHA, request.Grant.BaseSHA) {
 		return Outcome{}, fmt.Errorf("repository revisions do not match the run grant")
 	}
-	treeSHA, err := ResolveMergeTree(ctx, repositoryPath, baseSHA, headSHA)
+	treeView, err := resolveMergeTreeView(ctx, repositoryPath, baseSHA, headSHA)
 	if err != nil {
 		return Outcome{}, err
 	}
-	if !strings.EqualFold(treeSHA, request.Grant.TreeSHA) {
+	defer os.RemoveAll(treeView.workspace)
+	if !strings.EqualFold(treeView.treeSHA, request.Grant.TreeSHA) {
 		return Outcome{}, fmt.Errorf("repository merge tree does not match the run grant")
 	}
 
@@ -65,11 +66,14 @@ func Run(ctx context.Context, request Request) (Outcome, error) {
 	defer os.RemoveAll(temporaryRoot)
 	workspace := filepath.Join(temporaryRoot, "source")
 	if _, err := treesource.Materialize(ctx, treesource.Options{
-		RepositoryPath: repositoryPath,
-		TreeSHA:        treeSHA,
-		Destination:    workspace,
-		MaxEntries:     request.Container.MaxTreeEntries,
-		MaxBytes:       request.Container.MaxTreeBytes,
+		RepositoryPath:           repositoryPath,
+		TreeSHA:                  treeView.treeSHA,
+		GitDirectory:             treeView.gitDirectory,
+		ObjectDirectory:          treeView.objectDirectory,
+		AlternateObjectDirectory: treeView.alternateObjectDirectory,
+		Destination:              workspace,
+		MaxEntries:               request.Container.MaxTreeEntries,
+		MaxBytes:                 request.Container.MaxTreeBytes,
 	}); err != nil {
 		return Outcome{}, fmt.Errorf("materialize tested tree: %w", err)
 	}
@@ -132,7 +136,7 @@ func Run(ctx context.Context, request Request) (Outcome, error) {
 		Repository:        request.Grant.Policy.Repository,
 		HeadSHA:           headSHA,
 		BaseSHA:           baseSHA,
-		TreeSHA:           treeSHA,
+		TreeSHA:           treeView.treeSHA,
 		Profile:           request.Grant.Policy.Profile,
 		PolicyDigest:      request.Grant.PolicyDigest,
 		WorkflowDigest:    request.Grant.WorkflowDigest,
@@ -140,7 +144,6 @@ func Run(ctx context.Context, request Request) (Outcome, error) {
 		Architecture:      request.Grant.Architecture,
 		Jobs: []attestation.JobResult{{
 			Name:        request.Grant.Policy.Profile,
-			Command:     append([]string(nil), request.Grant.Policy.Command...),
 			ExitCode:    exitCode,
 			Conclusion:  conclusion,
 			StartedAt:   startedAt,
@@ -201,50 +204,77 @@ func resolveCommit(ctx context.Context, repository, revision string) (string, er
 	return resolved, nil
 }
 
+type mergeTreeView struct {
+	treeSHA                  string
+	workspace                string
+	gitDirectory             string
+	objectDirectory          string
+	alternateObjectDirectory string
+}
+
 func ResolveMergeTree(ctx context.Context, repository, baseSHA, headSHA string) (string, error) {
-	output, err := runGit(ctx, repository, "merge-tree", "--write-tree", "--no-messages", baseSHA, headSHA)
+	view, err := resolveMergeTreeView(ctx, repository, baseSHA, headSHA)
 	if err != nil {
-		return "", fmt.Errorf("compute base-plus-head merge tree: %w: %s", err, strings.TrimSpace(string(output)))
+		return "", err
+	}
+	defer os.RemoveAll(view.workspace)
+	return view.treeSHA, nil
+}
+
+func resolveMergeTreeView(ctx context.Context, repository, baseSHA, headSHA string) (view mergeTreeView, err error) {
+	commonDirectoryOutput, err := runGit(ctx, repository, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return mergeTreeView{}, fmt.Errorf("resolve repository object directory: %w: %s", err, strings.TrimSpace(string(commonDirectoryOutput)))
+	}
+	sourceObjects := filepath.Join(strings.TrimSpace(string(commonDirectoryOutput)), "objects")
+	if strings.ContainsAny(sourceObjects, "\n\r"+string(filepath.ListSeparator)) {
+		return mergeTreeView{}, fmt.Errorf("repository object directory cannot be represented safely")
+	}
+	if info, err := os.Stat(sourceObjects); err != nil || !info.IsDir() {
+		return mergeTreeView{}, fmt.Errorf("repository object directory is unavailable")
+	}
+
+	workspace, err := os.MkdirTemp("", "cihash-merge-tree-*")
+	if err != nil {
+		return mergeTreeView{}, fmt.Errorf("create isolated merge workspace: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(workspace)
+		}
+	}()
+	templateDirectory := filepath.Join(workspace, "template")
+	if err := os.Mkdir(templateDirectory, 0o700); err != nil {
+		return mergeTreeView{}, fmt.Errorf("create empty Git template: %w", err)
+	}
+	gitDirectory := filepath.Join(workspace, "repository.git")
+	if output, err := gitexec.Command(ctx, "git", "", "init", "--bare", "--template="+templateDirectory, gitDirectory).CombinedOutput(); err != nil {
+		return mergeTreeView{}, fmt.Errorf("initialize isolated merge repository: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	objectDirectory := filepath.Join(gitDirectory, "objects")
+	output, err := gitexec.ObjectCommand(ctx, "git", gitDirectory, objectDirectory, sourceObjects, "merge-tree", "--write-tree", "--no-messages", baseSHA, headSHA).CombinedOutput()
+	if err != nil {
+		return mergeTreeView{}, fmt.Errorf("compute base-plus-head merge tree: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	treeSHA := strings.TrimSpace(string(output))
 	if !validGitObjectID(treeSHA) || len(treeSHA) != len(headSHA) {
-		return "", fmt.Errorf("Git returned an invalid merge tree identity")
+		return mergeTreeView{}, fmt.Errorf("Git returned an invalid merge tree identity")
 	}
-	objectType, err := runGit(ctx, repository, "cat-file", "-t", treeSHA)
+	objectType, err := gitexec.ObjectCommand(ctx, "git", gitDirectory, objectDirectory, sourceObjects, "cat-file", "-t", treeSHA).CombinedOutput()
 	if err != nil || strings.TrimSpace(string(objectType)) != "tree" {
-		return "", fmt.Errorf("computed merge object is not a tree")
+		return mergeTreeView{}, fmt.Errorf("computed merge object is not a tree")
 	}
-	return treeSHA, nil
+	return mergeTreeView{
+		treeSHA:                  treeSHA,
+		workspace:                workspace,
+		gitDirectory:             gitDirectory,
+		objectDirectory:          objectDirectory,
+		alternateObjectDirectory: sourceObjects,
+	}, nil
 }
 
 func runGit(ctx context.Context, directory string, arguments ...string) ([]byte, error) {
 	return gitexec.Command(ctx, "git", directory, arguments...).CombinedOutput()
-}
-
-func gitEnvironment() []string {
-	blocked := map[string]struct{}{
-		"GIT_ALTERNATE_OBJECT_DIRECTORIES": {},
-		"GIT_CONFIG_COUNT":                 {},
-		"GIT_CONFIG_GLOBAL":                {},
-		"GIT_CONFIG_KEY_0":                 {},
-		"GIT_CONFIG_SYSTEM":                {},
-		"GIT_CONFIG_VALUE_0":               {},
-		"GIT_DIR":                          {},
-		"GIT_INDEX_FILE":                   {},
-		"GIT_OBJECT_DIRECTORY":             {},
-		"GIT_REPLACE_REF_BASE":             {},
-		"GIT_SHALLOW_FILE":                 {},
-		"GIT_WORK_TREE":                    {},
-	}
-	current := os.Environ()
-	environment := make([]string, 0, len(current)+2)
-	for _, variable := range current {
-		name, _, _ := strings.Cut(variable, "=")
-		if _, excluded := blocked[name]; !excluded && !strings.HasPrefix(name, "GIT_CONFIG_KEY_") && !strings.HasPrefix(name, "GIT_CONFIG_VALUE_") {
-			environment = append(environment, variable)
-		}
-	}
-	return append(environment, "GIT_NO_REPLACE_OBJECTS=1", "GIT_CONFIG_NOSYSTEM=1")
 }
 
 func validGitObjectID(value string) bool {

@@ -14,6 +14,7 @@ import (
 	"hash"
 	"io"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -29,12 +30,15 @@ const (
 )
 
 type Options struct {
-	RepositoryPath string
-	TreeSHA        string
-	Destination    string
-	GitBinary      string
-	MaxEntries     int
-	MaxBytes       int64
+	RepositoryPath           string
+	TreeSHA                  string
+	Destination              string
+	GitBinary                string
+	GitDirectory             string
+	ObjectDirectory          string
+	AlternateObjectDirectory string
+	MaxEntries               int
+	MaxBytes                 int64
 }
 
 type Result struct {
@@ -48,6 +52,10 @@ type Result struct {
 func Materialize(ctx context.Context, options Options) (result Result, err error) {
 	if !validGitObjectID(options.TreeSHA) {
 		return Result{}, fmt.Errorf("tree SHA must be a 40- or 64-character hexadecimal Git object ID")
+	}
+	objectViewConfigured := options.GitDirectory != "" || options.ObjectDirectory != "" || options.AlternateObjectDirectory != ""
+	if objectViewConfigured && (options.GitDirectory == "" || options.ObjectDirectory == "" || options.AlternateObjectDirectory == "") {
+		return Result{}, fmt.Errorf("isolated Git object view is incomplete")
 	}
 	repository, err := filepath.Abs(options.RepositoryPath)
 	if err != nil {
@@ -74,7 +82,7 @@ func Materialize(ctx context.Context, options Options) (result Result, err error
 	if git == "" {
 		git = "git"
 	}
-	objectType, commandErr := gitexec.Command(ctx, git, repository, "cat-file", "-t", options.TreeSHA).CombinedOutput()
+	objectType, commandErr := gitCommand(ctx, git, repository, options, "cat-file", "-t", options.TreeSHA).CombinedOutput()
 	if commandErr != nil {
 		return Result{}, fmt.Errorf("inspect Git object: %w: %s", commandErr, strings.TrimSpace(string(objectType)))
 	}
@@ -93,7 +101,7 @@ func Materialize(ctx context.Context, options Options) (result Result, err error
 	if maxEntries < 1 || maxBytes < 1 {
 		return Result{}, fmt.Errorf("tree extraction limits must be positive")
 	}
-	manifest, err := readTreeManifest(ctx, git, repository, options.TreeSHA, maxEntries, maxBytes)
+	manifest, err := readTreeManifest(ctx, git, repository, options, options.TreeSHA, maxEntries, maxBytes)
 	if err != nil {
 		return Result{}, err
 	}
@@ -110,7 +118,7 @@ func Materialize(ctx context.Context, options Options) (result Result, err error
 		}
 	}()
 
-	archive := gitexec.Command(ctx, git, repository, "archive", "--format=tar", options.TreeSHA)
+	archive := gitCommand(ctx, git, repository, options, "archive", "--format=tar", options.TreeSHA)
 	var stderr bytes.Buffer
 	archive.Stderr = &stderr
 	stdout, err := archive.StdoutPipe()
@@ -139,14 +147,21 @@ func Materialize(ctx context.Context, options Options) (result Result, err error
 	return Result{TreeSHA: options.TreeSHA, Entries: len(manifest), Bytes: bytesWritten}, nil
 }
 
+func gitCommand(ctx context.Context, git, repository string, options Options, arguments ...string) *exec.Cmd {
+	if options.GitDirectory != "" {
+		return gitexec.ObjectCommand(ctx, git, options.GitDirectory, options.ObjectDirectory, options.AlternateObjectDirectory, arguments...)
+	}
+	return gitexec.Command(ctx, git, repository, arguments...)
+}
+
 type manifestEntry struct {
 	mode     string
 	objectID string
 	size     int64
 }
 
-func readTreeManifest(ctx context.Context, git, repository, treeSHA string, maxEntries int, maxBytes int64) (map[string]manifestEntry, error) {
-	command := gitexec.Command(ctx, git, repository, "ls-tree", "-r", "-l", "-z", "--full-tree", treeSHA)
+func readTreeManifest(ctx context.Context, git, repository string, options Options, treeSHA string, maxEntries int, maxBytes int64) (map[string]manifestEntry, error) {
+	command := gitCommand(ctx, git, repository, options, "ls-tree", "-r", "-l", "-z", "--full-tree", treeSHA)
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
 	stdout, err := command.StdoutPipe()

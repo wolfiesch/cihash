@@ -73,6 +73,29 @@ func TestResolveMergeTreeIgnoresRepositoryReplacementRefs(t *testing.T) {
 	}
 }
 
+func TestResolveMergeTreeDoesNotExecuteRepositoryMergeDriver(t *testing.T) {
+	repository, baseSHA, headSHA := createConflictedRepository(t)
+	attributesPath := git(t, repository, "rev-parse", "--git-path", "info/attributes")
+	if !filepath.IsAbs(attributesPath) {
+		attributesPath = filepath.Join(repository, attributesPath)
+	}
+	if err := os.WriteFile(attributesPath, []byte("conflict.txt merge=host-command\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	driverDirectory := t.TempDir()
+	driver := filepath.Join(driverDirectory, "merge-driver")
+	marker := filepath.Join(driverDirectory, "executed")
+	if err := os.WriteFile(driver, []byte("#!/bin/sh\ntouch \"$(dirname \"$0\")/executed\"\ncp \"$3\" \"$2\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repository, "config", "merge.host-command.driver", driver+" %O %A %B")
+
+	_, _ = runner.ResolveMergeTree(context.Background(), repository, baseSHA, headSHA)
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("repository merge driver executed on host: %v", err)
+	}
+}
+
 func TestRunRejectsConflictedMergeBeforeExecution(t *testing.T) {
 	repository, baseSHA, headSHA := createConflictedRepository(t)
 	_, err := runner.Run(context.Background(), runner.Request{

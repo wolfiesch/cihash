@@ -108,12 +108,16 @@ For `opened`, `reopened`, `synchronize`, and `ready_for_review` events:
 Webhook delivery IDs are persisted. Completed or concurrent duplicate deliveries do not create another check.
 
 In shadow mode, `shadowWorkflow` and `shadowJob` select the ordinary Actions
-job used for parity evidence. A completed matching workflow event causes CIHash
-to fetch that exact job through the installation-scoped GitHub API. It records
-the proof decision, rejection code, ordinary job conclusion, proof verification
-latency, App decision latency, ordinary job duration, service source revision,
-service binary digest, build mode, policy timeout, and observation timestamps in
-the administrator-owned state directory. Aggregate workflow conclusions are not
+job used for parity evidence. CIHash accepts only first-attempt `pull_request`
+runs whose webhook identifies exactly one pull request with the recorded head
+and base. It then fetches the selected job through the installation-scoped
+GitHub API and binds that immutable run to every CIHash evaluation of the same
+pull request, head, and base. A push, manual dispatch, rerun, different base, or
+second conflicting run cannot replace the evidence. CIHash records the proof
+decision, rejection code, ordinary job conclusion, proof verification latency,
+App decision latency, ordinary job duration, service source revision, service
+binary digest, build mode, policy timeout, and observation timestamps in the
+administrator-owned state directory. Aggregate workflow conclusions are not
 used as a substitute for the selected job.
 
 ## Trusted fallback contract

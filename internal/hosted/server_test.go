@@ -198,7 +198,7 @@ func TestFallbackDispatchFailureKeepsConfiguredCheckName(t *testing.T) {
 }
 
 func TestShadowEvidenceCorrelatesAcceptedProofWithSelectedActionsJob(t *testing.T) {
-	server, _, secret, headSHA, baseSHA := hostedFixture(t, githubapp.ShadowMode, true)
+	server, client, secret, headSHA, baseSHA := hostedFixture(t, githubapp.ShadowMode, true)
 	server.config.ShadowWorkflow = "CI"
 	server.config.ShadowJob = "tooling"
 	server.serviceBuild.sourceRevision = strings.Repeat("e", 40)
@@ -212,14 +212,31 @@ func TestShadowEvidenceCorrelatesAcceptedProofWithSelectedActionsJob(t *testing.
 		"repository":   map[string]any{"full_name": "owner/project"},
 		"installation": map[string]any{"id": 123},
 		"workflow_run": map[string]any{
-			"id":         99,
-			"name":       "CI",
-			"head_sha":   headSHA,
+			"id":          99,
+			"name":        "CI",
+			"head_sha":    headSHA,
+			"event":       "pull_request",
+			"run_attempt": 1,
+			"pull_requests": []map[string]any{{
+				"number": 7,
+				"head":   map[string]any{"sha": headSHA},
+				"base":   map[string]any{"sha": baseSHA},
+			}},
 			"status":     "completed",
 			"conclusion": "failure",
 			"updated_at": "2026-07-20T12:02:00Z",
 		},
 	}
+	tokenCalls := client.tokenCalls
+	workflowRun := workflowBody["workflow_run"].(map[string]any)
+	workflowRun["event"] = "push"
+	if response := sendWebhook(t, server, secret, "workflow_run", "delivery-shadow-push", workflowBody); response.Code != http.StatusAccepted {
+		t.Fatalf("push workflow status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if client.tokenCalls != tokenCalls {
+		t.Fatal("push workflow fetched job evidence")
+	}
+	workflowRun["event"] = "pull_request"
 	if response := sendWebhook(t, server, secret, "workflow_run", "delivery-shadow-workflow", workflowBody); response.Code != http.StatusAccepted {
 		t.Fatalf("workflow status = %d, body = %s", response.Code, response.Body.String())
 	}

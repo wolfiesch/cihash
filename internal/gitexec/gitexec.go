@@ -18,35 +18,39 @@ func Command(ctx context.Context, binary, directory string, arguments ...string)
 	return command
 }
 
+func ObjectCommand(ctx context.Context, binary, gitDirectory, objectDirectory, alternateObjectDirectory string, arguments ...string) *exec.Cmd {
+	command := Command(ctx, binary, "", arguments...)
+	command.Env = append(command.Env,
+		"GIT_DIR="+gitDirectory,
+		"GIT_OBJECT_DIRECTORY="+objectDirectory,
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES="+alternateObjectDirectory,
+	)
+	return command
+}
+
 func environment() []string {
+	allowed := map[string]struct{}{
+		"LANG":     {},
+		"LC_ALL":   {},
+		"LC_CTYPE": {},
+		"PATH":     {},
+		"TEMP":     {},
+		"TMP":      {},
+		"TMPDIR":   {},
+	}
 	current := os.Environ()
-	result := make([]string, 0, len(current)+2)
+	result := make([]string, 0, len(allowed)+5)
 	for _, variable := range current {
 		name, _, _ := strings.Cut(variable, "=")
-		if !blocked(name) {
+		if _, ok := allowed[name]; ok {
 			result = append(result, variable)
 		}
 	}
-	return append(result, "GIT_NO_REPLACE_OBJECTS=1", "GIT_CONFIG_NOSYSTEM=1")
-}
-
-func blocked(name string) bool {
-	if strings.HasPrefix(name, "GIT_CONFIG_KEY_") || strings.HasPrefix(name, "GIT_CONFIG_VALUE_") {
-		return true
-	}
-	switch name {
-	case "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-		"GIT_CONFIG_COUNT",
-		"GIT_CONFIG_GLOBAL",
-		"GIT_CONFIG_SYSTEM",
-		"GIT_DIR",
-		"GIT_INDEX_FILE",
-		"GIT_OBJECT_DIRECTORY",
-		"GIT_REPLACE_REF_BASE",
-		"GIT_SHALLOW_FILE",
-		"GIT_WORK_TREE":
-		return true
-	default:
-		return false
-	}
+	return append(result,
+		"HOME=/nonexistent",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_NO_REPLACE_OBJECTS=1",
+	)
 }

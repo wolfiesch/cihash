@@ -51,6 +51,7 @@ func TestStoreClassifiesMismatchAndNonComparable(t *testing.T) {
 	}
 
 	decision.HeadSHA = strings.Repeat("d", 40)
+	decision.CheckRunID++
 	decision.TreeSHA = strings.Repeat("e", 40)
 	decision.ProofAccepted = false
 	decision.ProofCode = "proof_missing"
@@ -94,15 +95,47 @@ func TestReportRequiresComparableCompleteZeroMismatchEvidence(t *testing.T) {
 	}
 }
 
-func TestStoreRejectsConflictingDecisionForSameObservation(t *testing.T) {
+func TestStoreKeepsDistinctEvaluationsForSameCodeIdentity(t *testing.T) {
 	store := shadow.New(t.TempDir())
-	decision, _ := fixture()
-	if _, err := store.RecordDecision(decision); err != nil {
+	decision, workflow := fixture()
+	first, err := store.RecordDecision(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.RecordWorkflow(decision.Repository, workflow); err != nil {
 		t.Fatal(err)
 	}
 	decision.CheckRunID++
-	if _, err := store.RecordDecision(decision); err == nil {
-		t.Fatal("RecordDecision accepted conflicting evidence")
+	decision.EvaluatedAt = decision.EvaluatedAt.Add(time.Second)
+	second, err := store.RecordDecision(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID == second.ID {
+		t.Fatal("distinct check evaluations share an observation identity")
+	}
+	report, err := store.Report(workflow.CompletedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Total != 2 || report.Matches != 2 {
+		t.Fatalf("report = %+v, want both evaluations correlated", report)
+	}
+}
+
+func TestStoreRejectsDifferentWorkflowRunForBoundEvaluation(t *testing.T) {
+	store := shadow.New(t.TempDir())
+	decision, workflow := fixture()
+	if _, err := store.RecordDecision(decision); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.RecordWorkflow(decision.Repository, workflow); err != nil {
+		t.Fatal(err)
+	}
+	workflow.RunID++
+	workflow.CompletedAt = workflow.CompletedAt.Add(time.Minute)
+	if _, _, err := store.RecordWorkflow(decision.Repository, workflow); err == nil {
+		t.Fatal("RecordWorkflow replaced exact workflow evidence")
 	}
 }
 
@@ -128,11 +161,15 @@ func fixture() (shadow.Decision, shadow.Workflow) {
 			ServiceStartedAt:      now.Add(-time.Hour),
 			PolicyTimeoutSeconds:  1800,
 		}, shadow.Workflow{
-			Name:        "Tooling",
-			RunID:       99,
-			HeadSHA:     strings.Repeat("a", 40),
-			Conclusion:  "success",
-			StartedAt:   now.Add(time.Second),
-			CompletedAt: now.Add(time.Minute),
+			Name:              "Tooling",
+			RunID:             99,
+			PullRequestNumber: 7,
+			HeadSHA:           strings.Repeat("a", 40),
+			BaseSHA:           strings.Repeat("b", 40),
+			Event:             "pull_request",
+			RunAttempt:        1,
+			Conclusion:        "success",
+			StartedAt:         now.Add(time.Second),
+			CompletedAt:       now.Add(time.Minute),
 		}
 }

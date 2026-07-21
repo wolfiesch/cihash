@@ -9,12 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
-const SchemaVersion = "https://cihash.dev/shadow/observation/v0.1"
+const SchemaVersion = "https://cihash.dev/shadow/observation/v0.2"
 
 const (
 	ParityPending       = "pending"
@@ -46,13 +47,17 @@ type Decision struct {
 }
 
 type Workflow struct {
-	Name           string    `json:"name"`
-	RunID          int64     `json:"runId"`
-	HeadSHA        string    `json:"headSha"`
-	Conclusion     string    `json:"conclusion"`
-	StartedAt      time.Time `json:"startedAt"`
-	CompletedAt    time.Time `json:"completedAt"`
-	DurationMillis int64     `json:"durationMillis"`
+	Name              string    `json:"name"`
+	RunID             int64     `json:"runId"`
+	PullRequestNumber int64     `json:"pullRequestNumber"`
+	BaseSHA           string    `json:"baseSha"`
+	Event             string    `json:"event"`
+	RunAttempt        int       `json:"runAttempt"`
+	HeadSHA           string    `json:"headSha"`
+	Conclusion        string    `json:"conclusion"`
+	StartedAt         time.Time `json:"startedAt"`
+	CompletedAt       time.Time `json:"completedAt"`
+	DurationMillis    int64     `json:"durationMillis"`
 }
 
 type Observation struct {
@@ -82,7 +87,7 @@ type Store struct {
 }
 
 func New(root string) Store {
-	return Store{root: filepath.Join(root, "shadow")}
+	return Store{root: filepath.Join(root, "shadow-v0.2")}
 }
 
 func (store Store) RecordDecision(decision Decision) (Observation, error) {
@@ -92,7 +97,7 @@ func (store Store) RecordDecision(decision Decision) (Observation, error) {
 	decision.EvaluatedAt = decision.EvaluatedAt.UTC()
 	id := observationID(decision)
 	var observation Observation
-	err := store.withHeadLock(decision.Repository, decision.HeadSHA, func() error {
+	err := store.withCorrelationLock(decision.Repository, decision.PullRequestNumber, decision.HeadSHA, decision.BaseSHA, func() error {
 		path := store.observationPath(id)
 		existing, found, err := readObservation(path)
 		if err != nil {
@@ -100,7 +105,7 @@ func (store Store) RecordDecision(decision Decision) (Observation, error) {
 		}
 		if found {
 			if !sameDecision(existing.Decision, decision) {
-				return fmt.Errorf("shadow decision conflicts with existing observation")
+				return fmt.Errorf("shadow decision conflicts with existing evaluation")
 			}
 			observation = existing
 		} else {
@@ -110,22 +115,22 @@ func (store Store) RecordDecision(decision Decision) (Observation, error) {
 				Decision:      decision,
 				Parity:        ParityPending,
 			}
-			pending, pendingFound, err := store.readPending(decision.Repository, decision.HeadSHA)
+			workflow, workflowFound, err := store.readWorkflowEvidence(decision.Repository, decision.PullRequestNumber, decision.HeadSHA, decision.BaseSHA)
 			if err != nil {
 				return err
 			}
-			if pendingFound {
-				observation.Workflow = &pending
-				observation.Parity = parity(decision, &pending)
+			if workflowFound {
+				observation.Workflow = &workflow
+				observation.Parity = parity(decision, &workflow)
 			}
 			if err := writeJSONAtomic(path, observation); err != nil {
 				return err
 			}
 		}
-		if err := store.writeHeadIndex(decision.Repository, decision.HeadSHA, id); err != nil {
+		if err := store.appendCorrelationIndex(decision.Repository, decision.PullRequestNumber, decision.HeadSHA, decision.BaseSHA, id); err != nil {
 			return err
 		}
-		return store.removePending(decision.Repository, decision.HeadSHA)
+		return store.removePending(decision.Repository, decision.PullRequestNumber, decision.HeadSHA, decision.BaseSHA)
 	})
 	return observation, err
 }
@@ -137,32 +142,44 @@ func (store Store) RecordWorkflow(repository string, workflow Workflow) (Observa
 	workflow.StartedAt = workflow.StartedAt.UTC()
 	workflow.CompletedAt = workflow.CompletedAt.UTC()
 	workflow.DurationMillis = workflow.CompletedAt.Sub(workflow.StartedAt).Milliseconds()
-	var observation Observation
+	var recorded Observation
 	var found bool
-	err := store.withHeadLock(repository, workflow.HeadSHA, func() error {
-		id, indexFound, err := store.readHeadIndex(repository, workflow.HeadSHA)
+	err := store.withCorrelationLock(repository, workflow.PullRequestNumber, workflow.HeadSHA, workflow.BaseSHA, func() error {
+		ids, err := store.readCorrelationIndex(repository, workflow.PullRequestNumber, workflow.HeadSHA, workflow.BaseSHA)
 		if err != nil {
 			return err
 		}
-		if !indexFound {
+		if len(ids) == 0 {
 			return store.writePending(repository, workflow)
 		}
-		path := store.observationPath(id)
-		observation, found, err = readObservation(path)
-		if err != nil {
-			return err
+		observations := make([]Observation, 0, len(ids))
+		for _, id := range ids {
+			observation, exists, err := readObservation(store.observationPath(id))
+			if err != nil {
+				return err
+			}
+			if !exists {
+				return fmt.Errorf("shadow correlation index points to missing evidence")
+			}
+			if observation.Workflow != nil && !sameWorkflow(*observation.Workflow, workflow) {
+				return fmt.Errorf("shadow evaluation already has different workflow evidence")
+			}
+			observations = append(observations, observation)
 		}
-		if !found {
-			return fmt.Errorf("shadow observation index points to missing evidence")
+		for _, observation := range observations {
+			if observation.Workflow == nil {
+				observation.Workflow = &workflow
+				observation.Parity = parity(observation.Decision, &workflow)
+				if err := writeJSONAtomic(store.observationPath(observation.ID), observation); err != nil {
+					return err
+				}
+			}
+			recorded = observation
+			found = true
 		}
-		if observation.Workflow != nil && !workflow.CompletedAt.After(observation.Workflow.CompletedAt) {
-			return nil
-		}
-		observation.Workflow = &workflow
-		observation.Parity = parity(observation.Decision, &workflow)
-		return writeJSONAtomic(path, observation)
+		return nil
 	})
-	return observation, found, err
+	return recorded, found, err
 }
 
 func (store Store) Report(now time.Time) (Report, error) {
@@ -239,10 +256,10 @@ func validateDecision(decision Decision) error {
 }
 
 func validateWorkflow(repository string, workflow Workflow) error {
-	if repository == "" || workflow.Name == "" || workflow.RunID <= 0 || workflow.Conclusion == "" || workflow.StartedAt.IsZero() || workflow.CompletedAt.IsZero() {
+	if repository == "" || workflow.Name == "" || workflow.RunID <= 0 || workflow.PullRequestNumber <= 0 || workflow.Conclusion == "" || workflow.StartedAt.IsZero() || workflow.CompletedAt.IsZero() {
 		return fmt.Errorf("shadow workflow result is incomplete")
 	}
-	if !validGitObjectID(workflow.HeadSHA) || workflow.CompletedAt.Before(workflow.StartedAt) {
+	if !validGitObjectID(workflow.HeadSHA) || !validGitObjectID(workflow.BaseSHA) || workflow.Event != "pull_request" || workflow.RunAttempt != 1 || workflow.CompletedAt.Before(workflow.StartedAt) {
 		return fmt.Errorf("shadow workflow result is invalid")
 	}
 	return nil
@@ -267,8 +284,16 @@ func sameDecision(left, right Decision) bool {
 	return left == right
 }
 
+func sameWorkflow(left, right Workflow) bool {
+	left.StartedAt = left.StartedAt.UTC()
+	left.CompletedAt = left.CompletedAt.UTC()
+	right.StartedAt = right.StartedAt.UTC()
+	right.CompletedAt = right.CompletedAt.UTC()
+	return left == right
+}
+
 func observationID(decision Decision) string {
-	return digest(strings.Join([]string{decision.Repository, decision.HeadSHA, decision.BaseSHA, decision.TreeSHA, decision.PolicyDigest}, "\x00"))
+	return digest(strings.Join([]string{decision.Repository, strconv.FormatInt(decision.CheckRunID, 10)}, "\x00"))
 }
 
 func validGitObjectID(value string) bool {
@@ -283,11 +308,11 @@ func validGitObjectID(value string) bool {
 	return true
 }
 
-func (store Store) withHeadLock(repository, headSHA string, operation func() error) error {
+func (store Store) withCorrelationLock(repository string, pullRequestNumber int64, headSHA, baseSHA string, operation func() error) error {
 	if err := os.MkdirAll(filepath.Join(store.root, "locks"), 0o700); err != nil {
 		return fmt.Errorf("create shadow lock directory: %w", err)
 	}
-	lock, err := os.OpenFile(filepath.Join(store.root, "locks", digest(repository+"\x00"+headSHA)+".lock"), os.O_RDWR|os.O_CREATE, 0o600)
+	lock, err := os.OpenFile(filepath.Join(store.root, "locks", correlationKey(repository, pullRequestNumber, headSHA, baseSHA)+".lock"), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return fmt.Errorf("open shadow evidence lock: %w", err)
 	}
@@ -303,49 +328,98 @@ func (store Store) observationPath(id string) string {
 	return filepath.Join(store.root, "observations", id+".json")
 }
 
-func (store Store) writeHeadIndex(repository, headSHA, id string) error {
-	path := filepath.Join(store.root, "heads", digest(repository+"\x00"+headSHA))
-	return writeBytesAtomic(path, []byte(id+"\n"), 0o600)
-}
-
-func (store Store) readHeadIndex(repository, headSHA string) (string, bool, error) {
-	path := filepath.Join(store.root, "heads", digest(repository+"\x00"+headSHA))
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return "", false, nil
-	}
+func (store Store) appendCorrelationIndex(repository string, pullRequestNumber int64, headSHA, baseSHA, id string) error {
+	ids, err := store.readCorrelationIndex(repository, pullRequestNumber, headSHA, baseSHA)
 	if err != nil {
-		return "", false, fmt.Errorf("read shadow head index: %w", err)
+		return err
 	}
-	id := strings.TrimSpace(string(data))
-	if len(id) != sha256.Size*2 {
-		return "", false, fmt.Errorf("shadow head index is malformed")
+	for _, existing := range ids {
+		if existing == id {
+			return nil
+		}
 	}
-	return id, true, nil
+	ids = append(ids, id)
+	path := filepath.Join(store.root, "correlations", correlationKey(repository, pullRequestNumber, headSHA, baseSHA)+".json")
+	return writeJSONAtomic(path, ids)
 }
 
-func (store Store) pendingPath(repository, headSHA string) string {
-	return filepath.Join(store.root, "pending", digest(repository+"\x00"+headSHA)+".json")
+func (store Store) readCorrelationIndex(repository string, pullRequestNumber int64, headSHA, baseSHA string) ([]string, error) {
+	path := filepath.Join(store.root, "correlations", correlationKey(repository, pullRequestNumber, headSHA, baseSHA)+".json")
+	var ids []string
+	found, err := readJSON(path, &ids)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, nil
+	}
+	for _, id := range ids {
+		if len(id) != sha256.Size*2 {
+			return nil, fmt.Errorf("shadow correlation index is malformed")
+		}
+	}
+	return ids, nil
+}
+
+func (store Store) readWorkflowEvidence(repository string, pullRequestNumber int64, headSHA, baseSHA string) (Workflow, bool, error) {
+	ids, err := store.readCorrelationIndex(repository, pullRequestNumber, headSHA, baseSHA)
+	if err != nil {
+		return Workflow{}, false, err
+	}
+	var evidence Workflow
+	var found bool
+	for _, id := range ids {
+		observation, exists, err := readObservation(store.observationPath(id))
+		if err != nil {
+			return Workflow{}, false, err
+		}
+		if !exists {
+			return Workflow{}, false, fmt.Errorf("shadow correlation index points to missing evidence")
+		}
+		if observation.Workflow == nil {
+			continue
+		}
+		if found && !sameWorkflow(evidence, *observation.Workflow) {
+			return Workflow{}, false, fmt.Errorf("shadow correlation contains conflicting workflow evidence")
+		}
+		evidence = *observation.Workflow
+		found = true
+	}
+	if found {
+		return evidence, true, nil
+	}
+	return store.readPending(repository, pullRequestNumber, headSHA, baseSHA)
+}
+
+func correlationKey(repository string, pullRequestNumber int64, headSHA, baseSHA string) string {
+	return digest(strings.Join([]string{repository, strconv.FormatInt(pullRequestNumber, 10), headSHA, baseSHA}, "\x00"))
+}
+
+func (store Store) pendingPath(repository string, pullRequestNumber int64, headSHA, baseSHA string) string {
+	return filepath.Join(store.root, "pending", correlationKey(repository, pullRequestNumber, headSHA, baseSHA)+".json")
 }
 
 func (store Store) writePending(repository string, workflow Workflow) error {
-	path := store.pendingPath(repository, workflow.HeadSHA)
+	path := store.pendingPath(repository, workflow.PullRequestNumber, workflow.HeadSHA, workflow.BaseSHA)
 	existing, found, err := readWorkflow(path)
 	if err != nil {
 		return err
 	}
-	if found && !workflow.CompletedAt.After(existing.CompletedAt) {
-		return nil
+	if found {
+		if sameWorkflow(existing, workflow) {
+			return nil
+		}
+		return fmt.Errorf("shadow correlation already has different pending workflow evidence")
 	}
 	return writeJSONAtomic(path, workflow)
 }
 
-func (store Store) readPending(repository, headSHA string) (Workflow, bool, error) {
-	return readWorkflow(store.pendingPath(repository, headSHA))
+func (store Store) readPending(repository string, pullRequestNumber int64, headSHA, baseSHA string) (Workflow, bool, error) {
+	return readWorkflow(store.pendingPath(repository, pullRequestNumber, headSHA, baseSHA))
 }
 
-func (store Store) removePending(repository, headSHA string) error {
-	err := os.Remove(store.pendingPath(repository, headSHA))
+func (store Store) removePending(repository string, pullRequestNumber int64, headSHA, baseSHA string) error {
+	err := os.Remove(store.pendingPath(repository, pullRequestNumber, headSHA, baseSHA))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -364,9 +438,15 @@ func readObservation(path string) (Observation, bool, error) {
 	if err := validateDecision(observation.Decision); err != nil {
 		return Observation{}, false, err
 	}
+	if observation.ID != observationID(observation.Decision) {
+		return Observation{}, false, fmt.Errorf("shadow observation evaluation identity is invalid")
+	}
 	if observation.Workflow != nil {
 		if err := validateWorkflow(observation.Decision.Repository, *observation.Workflow); err != nil {
 			return Observation{}, false, err
+		}
+		if observation.Workflow.PullRequestNumber != observation.Decision.PullRequestNumber || observation.Workflow.HeadSHA != observation.Decision.HeadSHA || observation.Workflow.BaseSHA != observation.Decision.BaseSHA {
+			return Observation{}, false, fmt.Errorf("shadow workflow correlation identity is invalid")
 		}
 	}
 	if observation.Parity != parity(observation.Decision, observation.Workflow) {
