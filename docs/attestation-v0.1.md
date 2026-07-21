@@ -16,6 +16,24 @@ Receipts use a DSSE envelope:
 
 The signature covers DSSE pre-authentication encoding of the exact payload type and payload bytes. v0.1 permits exactly one Ed25519 signature.
 
+### Experimental threshold verification
+
+The hosted v0.1 decision path continues to require one configured signer. The
+`cihash lab trust-quorum` workbench separately exercises DSSE threshold
+verification over the same payload:
+
+- only cryptographically valid signatures from distinct trusted public keys
+  count toward the threshold;
+- repeated signatures from one key count once;
+- DSSE `keyid` values are unauthenticated lookup hints and never grant trust;
+- satisfying the signature threshold does not weaken repository, revision,
+  policy, workflow, environment, expiry, nonce, or job checks.
+
+This proves that the receipt and acceptance layers can represent quorum trust.
+It does not prove independent execution: the current workbench generates both
+signers in one process. A later confirmer experiment must place signers in
+separate trust domains and require agreement on one exact statement payload.
+
 ## Statement
 
 The decoded payload is an in-toto Statement v1:

@@ -19,9 +19,11 @@ import (
 	"time"
 
 	"github.com/wolfiesch/cihash/internal/attestation"
+	"github.com/wolfiesch/cihash/internal/containerexec"
 	"github.com/wolfiesch/cihash/internal/githubapi"
 	"github.com/wolfiesch/cihash/internal/githubapp"
 	"github.com/wolfiesch/cihash/internal/hosted"
+	"github.com/wolfiesch/cihash/internal/lab"
 	"github.com/wolfiesch/cihash/internal/policy"
 	"github.com/wolfiesch/cihash/internal/runner"
 	"github.com/wolfiesch/cihash/internal/store"
@@ -54,12 +56,16 @@ func execute(arguments []string, output io.Writer) *commandError {
 		return policyCommand(arguments[1:], output)
 	case "run":
 		return runCommand(arguments[1:], output)
+	case "container-exec":
+		return containerExecCommand(arguments[1:], output)
 	case "verify":
 		return verifyCommand(arguments[1:], output)
 	case "check":
 		return checkCommand(arguments[1:], output)
 	case "serve":
 		return serveCommand(arguments[1:], output)
+	case "lab":
+		return labCommand(arguments[1:], output)
 	case "version":
 		fmt.Fprintln(output, version)
 		return nil
@@ -276,6 +282,44 @@ func checkCommand(arguments []string, output io.Writer) *commandError {
 	return nil
 }
 
+func containerExecCommand(arguments []string, output io.Writer) *commandError {
+	flags := flag.NewFlagSet("container-exec", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	image := flags.String("image", "", "immutable container image digest")
+	network := flags.String("network", "none", "container network: none or bridge")
+	memory := flags.String("memory", "8g", "container memory limit")
+	cpus := flags.String("cpus", "6", "container CPU limit")
+	if err := flags.Parse(arguments); err != nil {
+		return usageError(err)
+	}
+	if *image == "" || len(flags.Args()) == 0 {
+		return usageError(errors.New("--image and a command after -- are required"))
+	}
+	directory, err := os.Getwd()
+	if err != nil {
+		return operationalError(fmt.Errorf("resolve container workspace: %w", err))
+	}
+	runContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	result, err := containerexec.Run(runContext, containerexec.Options{
+		Image:     *image,
+		Network:   *network,
+		Memory:    *memory,
+		CPUs:      *cpus,
+		Command:   flags.Args(),
+		Directory: directory,
+	})
+	if len(result) > 0 {
+		if _, writeErr := output.Write(result); writeErr != nil {
+			return operationalError(fmt.Errorf("write container output: %w", writeErr))
+		}
+	}
+	if err != nil {
+		return operationalError(err)
+	}
+	return nil
+}
+
 func serveCommand(arguments []string, output io.Writer) *commandError {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -321,6 +365,7 @@ func serveCommand(arguments []string, output io.Writer) *commandError {
 	if *checkConfig {
 		return writeJSON(output, map[string]any{
 			"listen":      configured.Listen,
+			"checkName":   configured.CheckName,
 			"mode":        configured.Mode,
 			"repository":  configured.Repository,
 			"webhookPath": configured.WebhookPath,
@@ -370,6 +415,23 @@ func serveCommand(arguments []string, output io.Writer) *commandError {
 	}
 }
 
+func labCommand(arguments []string, output io.Writer) *commandError {
+	if len(arguments) != 1 || arguments[0] != "trust-quorum" {
+		return usageError(errors.New("usage: cihash lab trust-quorum"))
+	}
+	report, err := lab.RunTrustQuorum()
+	if err != nil {
+		return operationalError(err)
+	}
+	if err := writeJSON(output, report); err != nil {
+		return err
+	}
+	if !report.Passed {
+		return operationalError(errors.New("trust quorum experiment did not satisfy expected decisions"))
+	}
+	return nil
+}
+
 func newNonce() (string, error) {
 	value := make([]byte, 32)
 	if _, err := rand.Read(value); err != nil {
@@ -404,5 +466,5 @@ func operationalError(err error) *commandError {
 }
 
 func printUsage(output io.Writer) {
-	fmt.Fprintln(output, "usage: cihash <keygen|policy|run|verify|check|serve|version> [options]")
+	fmt.Fprintln(output, "usage: cihash <keygen|policy|run|container-exec|verify|check|serve|lab|version> [options]")
 }

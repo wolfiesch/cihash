@@ -110,6 +110,33 @@ func Sign(statement Statement, privateKey ed25519.PrivateKey) (Envelope, error) 
 	}, nil
 }
 
+func AddSignature(envelope Envelope, privateKey ed25519.PrivateKey) (Envelope, error) {
+	if envelope.PayloadType != PayloadType {
+		return Envelope{}, fmt.Errorf("%w: payload type %q", ErrUnsupportedVersion, envelope.PayloadType)
+	}
+	payload, err := base64.StdEncoding.DecodeString(envelope.Payload)
+	if err != nil {
+		return Envelope{}, fmt.Errorf("%w: decode payload: %v", ErrMalformedReceipt, err)
+	}
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	message := preAuthenticationEncoding(envelope.PayloadType, payload)
+	for _, existing := range envelope.Signatures {
+		signatureBytes, err := base64.StdEncoding.DecodeString(existing.Sig)
+		if err != nil {
+			return Envelope{}, fmt.Errorf("%w: decode signature: %v", ErrMalformedReceipt, err)
+		}
+		if ed25519.Verify(publicKey, message, signatureBytes) {
+			return Envelope{}, fmt.Errorf("%w: signer already signed envelope", ErrMalformedReceipt)
+		}
+	}
+	envelope.Signatures = append([]Signature(nil), envelope.Signatures...)
+	envelope.Signatures = append(envelope.Signatures, Signature{
+		KeyID: KeyID(publicKey),
+		Sig:   base64.StdEncoding.EncodeToString(ed25519.Sign(privateKey, message)),
+	})
+	return envelope, nil
+}
+
 func VerifySignature(envelope Envelope, publicKey ed25519.PublicKey) (Statement, error) {
 	if envelope.PayloadType != PayloadType {
 		return Statement{}, fmt.Errorf("%w: payload type %q", ErrUnsupportedVersion, envelope.PayloadType)
@@ -132,7 +159,63 @@ func VerifySignature(envelope Envelope, publicKey ed25519.PublicKey) (Statement,
 	if !ed25519.Verify(publicKey, preAuthenticationEncoding(envelope.PayloadType, payload), signatureBytes) {
 		return Statement{}, ErrInvalidSignature
 	}
+	return decodeStatement(payload)
+}
 
+func VerifyThresholdSignatures(envelope Envelope, publicKeys []ed25519.PublicKey, threshold int) (Statement, error) {
+	if envelope.PayloadType != PayloadType {
+		return Statement{}, fmt.Errorf("%w: payload type %q", ErrUnsupportedVersion, envelope.PayloadType)
+	}
+	if threshold <= 0 {
+		return Statement{}, fmt.Errorf("%w: signature threshold must be positive", ErrMalformedReceipt)
+	}
+	trustedKeys := make([]ed25519.PublicKey, 0, len(publicKeys))
+	seenKeys := make(map[string]struct{}, len(publicKeys))
+	for _, publicKey := range publicKeys {
+		if len(publicKey) != ed25519.PublicKeySize {
+			return Statement{}, fmt.Errorf("%w: trusted public key is invalid", ErrUntrustedSigner)
+		}
+		key := string(publicKey)
+		if _, duplicate := seenKeys[key]; duplicate {
+			continue
+		}
+		seenKeys[key] = struct{}{}
+		trustedKeys = append(trustedKeys, publicKey)
+	}
+	if threshold > len(trustedKeys) {
+		return Statement{}, fmt.Errorf("%w: signature threshold exceeds unique trusted keys", ErrUntrustedSigner)
+	}
+	if len(envelope.Signatures) < threshold {
+		return Statement{}, fmt.Errorf("%w: signature threshold not met", ErrUntrustedSigner)
+	}
+	payload, err := base64.StdEncoding.DecodeString(envelope.Payload)
+	if err != nil {
+		return Statement{}, fmt.Errorf("%w: decode payload: %v", ErrMalformedReceipt, err)
+	}
+	signatures := make([][]byte, len(envelope.Signatures))
+	for index, signature := range envelope.Signatures {
+		signatures[index], err = base64.StdEncoding.DecodeString(signature.Sig)
+		if err != nil {
+			return Statement{}, fmt.Errorf("%w: decode signature: %v", ErrMalformedReceipt, err)
+		}
+	}
+	message := preAuthenticationEncoding(envelope.PayloadType, payload)
+	validSigners := 0
+	for _, publicKey := range trustedKeys {
+		for _, signature := range signatures {
+			if ed25519.Verify(publicKey, message, signature) {
+				validSigners++
+				break
+			}
+		}
+	}
+	if validSigners < threshold {
+		return Statement{}, fmt.Errorf("%w: signature threshold not met: got %d, need %d", ErrUntrustedSigner, validSigners, threshold)
+	}
+	return decodeStatement(payload)
+}
+
+func decodeStatement(payload []byte) (Statement, error) {
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	var statement Statement

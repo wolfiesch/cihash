@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"fmt"
 
+	"github.com/wolfiesch/cihash/internal/acceptance"
 	"github.com/wolfiesch/cihash/internal/store"
 	"github.com/wolfiesch/cihash/internal/verifier"
 )
@@ -42,37 +43,25 @@ type Result struct {
 }
 
 func Evaluate(receiptStore store.Store, publicKey ed25519.PublicKey, expected verifier.Expected, mode Mode) Result {
-	identity := store.Identity{
-		Repository:        expected.Repository,
-		HeadSHA:           expected.HeadSHA,
-		BaseSHA:           expected.BaseSHA,
-		Profile:           expected.Profile,
-		PolicyDigest:      expected.PolicyDigest,
-		WorkflowDigest:    expected.WorkflowDigest,
-		EnvironmentDigest: expected.EnvironmentDigest,
-	}
-	envelope, receiptPath, found, err := receiptStore.Lookup(identity)
-	if err != nil {
-		return rejectedResult(mode, expected.HeadSHA, "malformed_receipt", err.Error(), receiptPath, identity)
-	}
-	if !found {
-		return rejectedResult(mode, expected.HeadSHA, "proof_missing", "no proof matches the required identity", receiptPath, identity)
-	}
-	decision := verifier.Verify(envelope, publicKey, expected)
+	decision := acceptance.Evaluate(
+		receiptStore,
+		acceptance.Ed25519Evaluator{PublicKey: publicKey},
+		expected,
+	)
 	if !decision.Accepted {
-		return rejectedResult(mode, expected.HeadSHA, decision.Code, decision.Message, receiptPath, identity)
+		return rejectedResult(mode, expected.HeadSHA, decision.Code, decision.Message, decision.ReceiptPath, decision.Identity)
 	}
 	return Result{
 		Accepted:    true,
 		Code:        decision.Code,
 		Message:     decision.Message,
-		ReceiptPath: receiptPath,
+		ReceiptPath: decision.ReceiptPath,
 		CheckRun: CheckRunRequest{
 			Name:       CheckName,
 			HeadSHA:    expected.HeadSHA,
 			Status:     "completed",
 			Conclusion: "success",
-			ExternalID: externalID(identity),
+			ExternalID: externalID(decision.Identity),
 			Output: CheckRunOutput{
 				Title:   "CIHash proof accepted",
 				Summary: decision.Message,

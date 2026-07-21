@@ -18,6 +18,32 @@ func TestVerifyAcceptsExactSuccessfulProof(t *testing.T) {
 	}
 }
 
+func TestVerifyThresholdRequiresQuorumBeforeClaimValidation(t *testing.T) {
+	envelope, publicKeyA, expected := signedFixture(t, "success")
+	publicKeyB, privateKeyB, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	singleSignature := envelope
+	envelope, err = attestation.AddSignature(envelope, privateKeyB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := VerifyThreshold(envelope, []ed25519.PublicKey{publicKeyA, publicKeyB}, 2, expected)
+	if !decision.Accepted || decision.Code != "accepted" {
+		t.Fatalf("decision = %+v, want accepted quorum", decision)
+	}
+	expected.BaseSHA = strings.Repeat("d", 40)
+	decision = VerifyThreshold(envelope, []ed25519.PublicKey{publicKeyA, publicKeyB}, 2, expected)
+	if decision.Accepted || decision.Code != "base_mismatch" {
+		t.Fatalf("decision = %+v, want base_mismatch after quorum", decision)
+	}
+	decision = VerifyThreshold(singleSignature, []ed25519.PublicKey{publicKeyA, publicKeyB}, 2, expected)
+	if decision.Accepted || decision.Code != "untrusted_signer" {
+		t.Fatalf("decision = %+v, want untrusted_signer without quorum", decision)
+	}
+}
+
 func TestVerifyRejectsChangedBase(t *testing.T) {
 	envelope, publicKey, expected := signedFixture(t, "success")
 	expected.BaseSHA = strings.Repeat("d", 40)

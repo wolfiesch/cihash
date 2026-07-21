@@ -39,6 +39,18 @@ func Verify(envelope attestation.Envelope, publicKey ed25519.PublicKey, expected
 	if err != nil {
 		return signatureDecision(err)
 	}
+	return verifyStatement(statement, expected)
+}
+
+func VerifyThreshold(envelope attestation.Envelope, publicKeys []ed25519.PublicKey, threshold int, expected Expected) Decision {
+	statement, err := attestation.VerifyThresholdSignatures(envelope, publicKeys, threshold)
+	if err != nil {
+		return signatureDecision(err)
+	}
+	return verifyStatement(statement, expected)
+}
+
+func verifyStatement(statement attestation.Statement, expected Expected) Decision {
 	if decision := validateStatement(statement, expected); !decision.Accepted {
 		return decision
 	}

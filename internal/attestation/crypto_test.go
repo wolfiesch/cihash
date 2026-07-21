@@ -29,6 +29,57 @@ func TestSignAndVerifyExactStatement(t *testing.T) {
 	}
 }
 
+func TestVerifyThresholdSignaturesCountsDistinctTrustedKeys(t *testing.T) {
+	publicKeyA, privateKeyA, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKeyB, privateKeyB, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statement := NewStatement(testResult("success"))
+	envelope, err := Sign(statement, privateKeyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err = AddSignature(envelope, privateKeyB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope.Signatures[0].KeyID = KeyID(publicKeyB)
+	envelope.Signatures[1].KeyID = "unauthenticated-hint"
+	verified, err := VerifyThresholdSignatures(envelope, []ed25519.PublicKey{publicKeyA, publicKeyB}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.Predicate.HeadSHA != statement.Predicate.HeadSHA {
+		t.Fatalf("verified head %q, want %q", verified.Predicate.HeadSHA, statement.Predicate.HeadSHA)
+	}
+}
+
+func TestVerifyThresholdSignaturesRejectsDuplicateSigner(t *testing.T) {
+	publicKeyA, privateKeyA, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKeyB, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := Sign(NewStatement(testResult("success")), privateKeyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope.Signatures = append(envelope.Signatures, envelope.Signatures[0])
+	if _, err := VerifyThresholdSignatures(envelope, []ed25519.PublicKey{publicKeyA, publicKeyB}, 2); !errors.Is(err, ErrUntrustedSigner) {
+		t.Fatalf("VerifyThresholdSignatures error = %v, want ErrUntrustedSigner", err)
+	}
+	if _, err := AddSignature(envelope, privateKeyA); !errors.Is(err, ErrMalformedReceipt) {
+		t.Fatalf("AddSignature error = %v, want ErrMalformedReceipt", err)
+	}
+}
+
 func TestVerifyRejectsTamperedPayload(t *testing.T) {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
