@@ -158,7 +158,7 @@ PR [pilot-org/pilot-repo#112](https://github.com/pilot-org/pilot-repo/pull/112) 
 - Workflow digest: `sha256:09588c4b68e7c19fa3bfaebc18171cff90fc0110b4c36212f99edecd56f1b95f`
 - Environment digest: `sha256:33c68dc1b37225c4b716f86176bbd4ef55a5ac3fbe7bab3ccb3732928fac30ac`
 - Ordinary T4 tooling job: [success](https://github.com/pilot-org/pilot-repo/actions/runs/29802654038/job/88546592164)
-- CIHash App check: [success](https://github.com/pilot-org/pilot-repo/runs/88569144819)
+- CIHash App check: [success](https://github.com/pilot-org/pilot-repo/runs/88571396501)
 
 The CIHash profile covers only the offline subset listed above, so these results establish agreement for that subset and the proof/check round trip. They do not establish a performance comparison or full `tooling` job equivalence.
 
