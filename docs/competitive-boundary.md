@@ -37,3 +37,23 @@ Use it when those conditions hold without importing unnecessary distributed-syst
 - measured proof eligibility and avoided critical-path latency;
 - open receipt verification;
 - managed and customer-controlled trusted runners under one policy model.
+
+## Executable product-research workbench
+
+CIHash keeps product experiments behind `cihash lab` so protocol questions are
+answered with executable, adversarial scenarios before they affect the hosted
+required check:
+
+- `trust-quorum` proves distinct trusted Ed25519 keys can enforce a threshold
+  over one exact receipt while duplicate signatures, spoofed key IDs, stale
+  bases, tampering, and ordinary claim mismatches still fail closed;
+- `applicability` maps exact-commit, moving-base, and merge-group reuse and makes
+  the missing tree-only execution boundary explicit;
+- `confirmer` proves two receipts with different clocks and nonces can be
+  compared honestly through a 2-of-2 agreement bound to approved receipt keys,
+  domain names, and both canonical evidence-envelope digests.
+
+These experiments establish representational feasibility, not hosted
+authorization or market demand. They narrow the next product questions to
+independent trust-domain execution, immutable GitHub-state resolution,
+evidence lifecycle, producer conformance, and measurable avoided CI latency.

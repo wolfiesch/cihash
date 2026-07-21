@@ -107,6 +107,53 @@ func TestUnmarshalEnvelopeRejectsTrailingDocument(t *testing.T) {
 	}
 }
 
+func TestSignAndVerifyPayload(t *testing.T) {
+	publicKeyA, privateKeyA, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKeyB, privateKeyB, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"_type":"experimental"}`)
+	envelope, err := SignPayload("application/vnd.cihash.experimental+json", payload, privateKeyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cosigner, err := SignPayload("application/vnd.cihash.experimental+json", payload, privateKeyB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope.Signatures = append(envelope.Signatures, cosigner.Signatures...)
+	verified, err := VerifyThresholdPayload(envelope, []ed25519.PublicKey{publicKeyA, publicKeyB}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(verified) != string(payload) {
+		t.Fatalf("payload = %q, want %q", verified, payload)
+	}
+}
+
+func TestVerifyThresholdPayloadRejectsDuplicateSigner(t *testing.T) {
+	publicKeyA, privateKeyA, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKeyB, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := SignPayload("application/vnd.cihash.experimental+json", []byte("payload"), privateKeyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope.Signatures = append(envelope.Signatures, envelope.Signatures[0])
+	if _, err := VerifyThresholdPayload(envelope, []ed25519.PublicKey{publicKeyA, publicKeyB}, 2); !errors.Is(err, ErrUntrustedSigner) {
+		t.Fatalf("VerifyThresholdPayload error = %v, want ErrUntrustedSigner", err)
+	}
+}
+
 func testResult(conclusion string) TestResult {
 	now := time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)
 	exitCode := 0

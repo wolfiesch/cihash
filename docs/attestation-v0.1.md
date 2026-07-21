@@ -30,9 +30,30 @@ verification over the same payload:
   policy, workflow, environment, expiry, nonce, or job checks.
 
 This proves that the receipt and acceptance layers can represent quorum trust.
-It does not prove independent execution: the current workbench generates both
-signers in one process. A later confirmer experiment must place signers in
-separate trust domains and require agreement on one exact statement payload.
+It does not prove independent execution: the `trust-quorum` workbench generates
+both signers in one process.
+
+### Experimental independent confirmation
+
+`cihash lab confirmer` exercises a separate in-toto agreement predicate for two
+v0.1 receipts under distinct administrator-approved signer-to-domain bindings.
+Each receipt keeps its own nonce, timestamps, expiry, and signature. The
+confirmer projects only the deterministic execution claim, compares those
+claims, and binds an agreement statement to the SHA-256 digest of the canonical
+stored serialization of each DSSE envelope. Both receipt keys then sign the
+exact agreement payload, producing a 2-of-2 agreement.
+
+The deterministic projection retains repository, head, base, tree, profile,
+policy, workflow, environment, architecture, job names, commands, exit codes,
+conclusions, log digests, and the overall conclusion. It excludes per-run clocks
+and nonces, so separately timed observations do not falsely claim identical
+runtime metadata.
+
+An agreement conclusion means only that the projected claims match. It is not a
+success authorization and is not accepted by the hosted v0.1 verifier. Any
+future authorization path must retrieve and fully validate both referenced
+receipts for freshness, nonce and replay state, exact policy and job set,
+success, signer independence, and evidence availability.
 
 ## Statement
 

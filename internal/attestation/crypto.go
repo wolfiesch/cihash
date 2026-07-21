@@ -98,10 +98,14 @@ func Sign(statement Statement, privateKey ed25519.PrivateKey) (Envelope, error) 
 	if err != nil {
 		return Envelope{}, fmt.Errorf("marshal statement: %w", err)
 	}
+	return SignPayload(PayloadType, payload, privateKey)
+}
+
+func SignPayload(payloadType string, payload []byte, privateKey ed25519.PrivateKey) (Envelope, error) {
 	publicKey := privateKey.Public().(ed25519.PublicKey)
-	signature := ed25519.Sign(privateKey, preAuthenticationEncoding(PayloadType, payload))
+	signature := ed25519.Sign(privateKey, preAuthenticationEncoding(payloadType, payload))
 	return Envelope{
-		PayloadType: PayloadType,
+		PayloadType: payloadType,
 		Payload:     base64.StdEncoding.EncodeToString(payload),
 		Signatures: []Signature{{
 			KeyID: KeyID(publicKey),
@@ -144,20 +148,15 @@ func VerifySignature(envelope Envelope, publicKey ed25519.PublicKey) (Statement,
 	if len(envelope.Signatures) != 1 {
 		return Statement{}, fmt.Errorf("%w: expected one signature", ErrMalformedReceipt)
 	}
-	signature := envelope.Signatures[0]
-	if signature.KeyID != KeyID(publicKey) {
-		return Statement{}, fmt.Errorf("%w: key id %q", ErrUntrustedSigner, signature.KeyID)
+	if envelope.Signatures[0].KeyID != KeyID(publicKey) {
+		return Statement{}, fmt.Errorf("%w: key id %q", ErrUntrustedSigner, envelope.Signatures[0].KeyID)
 	}
-	payload, err := base64.StdEncoding.DecodeString(envelope.Payload)
+	payload, err := VerifyThresholdPayload(envelope, []ed25519.PublicKey{publicKey}, 1)
 	if err != nil {
-		return Statement{}, fmt.Errorf("%w: decode payload: %v", ErrMalformedReceipt, err)
-	}
-	signatureBytes, err := base64.StdEncoding.DecodeString(signature.Sig)
-	if err != nil {
-		return Statement{}, fmt.Errorf("%w: decode signature: %v", ErrMalformedReceipt, err)
-	}
-	if !ed25519.Verify(publicKey, preAuthenticationEncoding(envelope.PayloadType, payload), signatureBytes) {
-		return Statement{}, ErrInvalidSignature
+		if errors.Is(err, ErrUntrustedSigner) {
+			return Statement{}, ErrInvalidSignature
+		}
+		return Statement{}, err
 	}
 	return decodeStatement(payload)
 }
@@ -166,14 +165,22 @@ func VerifyThresholdSignatures(envelope Envelope, publicKeys []ed25519.PublicKey
 	if envelope.PayloadType != PayloadType {
 		return Statement{}, fmt.Errorf("%w: payload type %q", ErrUnsupportedVersion, envelope.PayloadType)
 	}
+	payload, err := VerifyThresholdPayload(envelope, publicKeys, threshold)
+	if err != nil {
+		return Statement{}, err
+	}
+	return decodeStatement(payload)
+}
+
+func VerifyThresholdPayload(envelope Envelope, publicKeys []ed25519.PublicKey, threshold int) ([]byte, error) {
 	if threshold <= 0 {
-		return Statement{}, fmt.Errorf("%w: signature threshold must be positive", ErrMalformedReceipt)
+		return nil, fmt.Errorf("%w: signature threshold must be positive", ErrMalformedReceipt)
 	}
 	trustedKeys := make([]ed25519.PublicKey, 0, len(publicKeys))
 	seenKeys := make(map[string]struct{}, len(publicKeys))
 	for _, publicKey := range publicKeys {
 		if len(publicKey) != ed25519.PublicKeySize {
-			return Statement{}, fmt.Errorf("%w: trusted public key is invalid", ErrUntrustedSigner)
+			return nil, fmt.Errorf("%w: trusted public key is invalid", ErrUntrustedSigner)
 		}
 		key := string(publicKey)
 		if _, duplicate := seenKeys[key]; duplicate {
@@ -183,20 +190,20 @@ func VerifyThresholdSignatures(envelope Envelope, publicKeys []ed25519.PublicKey
 		trustedKeys = append(trustedKeys, publicKey)
 	}
 	if threshold > len(trustedKeys) {
-		return Statement{}, fmt.Errorf("%w: signature threshold exceeds unique trusted keys", ErrUntrustedSigner)
+		return nil, fmt.Errorf("%w: signature threshold exceeds unique trusted keys", ErrUntrustedSigner)
 	}
 	if len(envelope.Signatures) < threshold {
-		return Statement{}, fmt.Errorf("%w: signature threshold not met", ErrUntrustedSigner)
+		return nil, fmt.Errorf("%w: signature threshold not met", ErrUntrustedSigner)
 	}
 	payload, err := base64.StdEncoding.DecodeString(envelope.Payload)
 	if err != nil {
-		return Statement{}, fmt.Errorf("%w: decode payload: %v", ErrMalformedReceipt, err)
+		return nil, fmt.Errorf("%w: decode payload: %v", ErrMalformedReceipt, err)
 	}
 	signatures := make([][]byte, len(envelope.Signatures))
 	for index, signature := range envelope.Signatures {
 		signatures[index], err = base64.StdEncoding.DecodeString(signature.Sig)
 		if err != nil {
-			return Statement{}, fmt.Errorf("%w: decode signature: %v", ErrMalformedReceipt, err)
+			return nil, fmt.Errorf("%w: decode signature: %v", ErrMalformedReceipt, err)
 		}
 	}
 	message := preAuthenticationEncoding(envelope.PayloadType, payload)
@@ -210,9 +217,9 @@ func VerifyThresholdSignatures(envelope Envelope, publicKeys []ed25519.PublicKey
 		}
 	}
 	if validSigners < threshold {
-		return Statement{}, fmt.Errorf("%w: signature threshold not met: got %d, need %d", ErrUntrustedSigner, validSigners, threshold)
+		return nil, fmt.Errorf("%w: signature threshold not met: got %d, need %d", ErrUntrustedSigner, validSigners, threshold)
 	}
-	return decodeStatement(payload)
+	return payload, nil
 }
 
 func decodeStatement(payload []byte) (Statement, error) {

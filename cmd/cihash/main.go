@@ -416,10 +416,24 @@ func serveCommand(arguments []string, output io.Writer) *commandError {
 }
 
 func labCommand(arguments []string, output io.Writer) *commandError {
-	if len(arguments) != 1 || arguments[0] != "trust-quorum" {
-		return usageError(errors.New("usage: cihash lab trust-quorum"))
+	if len(arguments) != 1 {
+		return usageError(errors.New("usage: cihash lab <trust-quorum|applicability|confirmer>"))
 	}
-	report, err := lab.RunTrustQuorum()
+
+	var (
+		report lab.Report
+		err    error
+	)
+	switch arguments[0] {
+	case "trust-quorum":
+		report, err = lab.RunTrustQuorum()
+	case "applicability":
+		report, err = lab.RunApplicability()
+	case "confirmer":
+		report, err = lab.RunConfirmer()
+	default:
+		return usageError(errors.New("usage: cihash lab <trust-quorum|applicability|confirmer>"))
+	}
 	if err != nil {
 		return operationalError(err)
 	}
@@ -427,7 +441,7 @@ func labCommand(arguments []string, output io.Writer) *commandError {
 		return err
 	}
 	if !report.Passed {
-		return operationalError(errors.New("trust quorum experiment did not satisfy expected decisions"))
+		return operationalError(fmt.Errorf("%s experiment did not satisfy expected decisions", arguments[0]))
 	}
 	return nil
 }

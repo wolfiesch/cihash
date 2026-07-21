@@ -75,3 +75,20 @@ In enforcement mode:
 - only the CIHash App publishes the final required `cihash/verify` conclusion.
 
 No unsupported state is converted to success.
+
+## Experimental GitHub-state applicability
+
+`cihash lab applicability` separates two proof-reuse policies without changing
+the hosted decision path:
+
+- `strict_commits` requires the repository, pull-request or merge-group context,
+  head, base, merge tree, policy, workflow, and environment to match exactly;
+- `merge_tree` explores reuse after a base or context change only when the
+  repository, tested tree, policy, workflow, and environment remain exact.
+
+`merge_tree` is not safe for the current runner. The workload runs inside a Git
+clone and can observe commit, base, and merge metadata, so equal tree hashes do
+not establish equivalent execution inputs. A future tree-equivalent policy
+requires an administrator-approved tree-only execution mode that excludes
+repository metadata from the workload. Until that boundary exists and is
+measured, moved bases and merge-group changes continue to fail closed.
