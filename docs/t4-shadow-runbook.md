@@ -177,17 +177,20 @@ stale, malformed, and unsupported proofs remain visible but are classified as
 
 ## Verified demonstration
 
-PR [pilot-org/pilot-repo#112](https://github.com/pilot-org/pilot-repo/pull/112) was evaluated at:
+PR [pilot-org/pilot-repo#123](https://github.com/pilot-org/pilot-repo/pull/123) was evaluated at:
 
-- Head: `8e41d90b062c68a6745ef0d8a74cf24efa5d9937`
-- Base: `1b4690684066de85f23ef6748c9900596be1f5e8`
-- Tested merge tree: `9eff27c9101c96e9ad5f249fcc8dd05c94992c12`
+- Head: `7f83b64c1d35b63be0f74afca319a98819bb8341`
+- Base: `210ddfcb11b84da89b2c4b079a9517901168fa37`
+- Tested merge tree: `855ef8ce3c9b35a9d0957d4aa20f6b5366fba6bb`
 - Worker image: `sha256:8fdc397e0dfa64f1418aae9d707d5d093e0ffc695a360913434761f642a152e3`
-- Policy digest: `sha256:9f620596f58f012b6b4f020df2474a038fc72d78116b03ab0746b76b03591d24`
-- Workflow digest: `sha256:09588c4b68e7c19fa3bfaebc18171cff90fc0110b4c36212f99edecd56f1b95f`
-- Environment digest: `sha256:33c68dc1b37225c4b716f86176bbd4ef55a5ac3fbe7bab3ccb3732928fac30ac`
-- Ordinary T4 tooling job: [success](https://github.com/pilot-org/pilot-repo/actions/runs/29802654038/job/88546592164)
-- CIHash App check: [success](https://github.com/pilot-org/pilot-repo/runs/88571396501)
+- Policy digest: `sha256:509e2470dd07344a0797bf44737ed449c37622738ecd7b78b1b2253dd2ac4bf5`
+- Workflow digest: `sha256:48e5659326d60fabc9ae465c42c4156078117138607b7942482b68f860b7b54d`
+- Environment digest: `sha256:88bf3eb953c2159b8b67b936eea27f1fd524fae4113427f62aba02706e9334bd`
+- Receipt digest: `sha256:31ef79c1903416eff809ea9d61e92556ae999fdc37796c80d4428bdf49bbb3bd`
+- Hosted service source: `e4dc94e75b735ae4fe84628ea130bb017563803f`, unmodified production build
+- Ordinary T4 tooling job, run attempt 1: [success](https://github.com/pilot-org/pilot-repo/actions/runs/29822256625/job/88607416689)
+- CIHash App check: [success](https://github.com/pilot-org/pilot-repo/runs/88609660965)
+- Shadow parity report: one comparable match, zero pending, zero mismatches
 
 The CIHash profile covers only the offline subset listed above, so these results establish agreement for that subset and the proof/check round trip. They do not establish a performance comparison or full `tooling` job equivalence.
 
