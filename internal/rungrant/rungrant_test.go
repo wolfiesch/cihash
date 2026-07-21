@@ -1,0 +1,222 @@
+package rungrant
+
+import (
+	"bytes"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/wolfiesch/cihash/internal/attestation"
+	"github.com/wolfiesch/cihash/internal/policy"
+)
+
+func TestIssueBindsAdministratorPolicyAndServerNonce(t *testing.T) {
+	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+	configured := testPolicy()
+	entropy := bytes.NewReader(append(bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 32)...))
+	grant, err := issue(configured, strings.Repeat("a", 40), strings.Repeat("b", 40), "linux/amd64", now, entropy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grant.Policy.Repository != configured.Repository || grant.Policy.Profile != configured.Profile {
+		t.Fatalf("grant policy = %+v, want configured policy", grant.Policy)
+	}
+	if grant.ID == grant.Nonce || grant.ID == "" || grant.Nonce == "" {
+		t.Fatalf("grant identity is not independently generated: %+v", grant)
+	}
+	if got, want := grant.ExpiresAt, now.Add(time.Hour); !got.Equal(want) {
+		t.Fatalf("expiresAt = %v, want %v", got, want)
+	}
+
+	grant.Policy.Command[0] = "unapproved"
+	if err := grant.Validate(); !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("tampered policy error = %v, want ErrInvalidGrant", err)
+	}
+}
+
+func TestGrantRejectsEqualIDAndNonce(t *testing.T) {
+	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+	entropy := bytes.NewReader(bytes.Repeat([]byte{1}, 64))
+	if _, err := issue(testPolicy(), strings.Repeat("a", 40), strings.Repeat("b", 40), "linux/amd64", now, entropy); !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("equal ID and nonce error = %v, want ErrInvalidGrant", err)
+	}
+}
+
+func TestIssueRejectsInvalidExecutionIdentity(t *testing.T) {
+	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name         string
+		head         string
+		base         string
+		architecture string
+	}{
+		{name: "short head", head: "abc", base: strings.Repeat("b", 40), architecture: "linux/amd64"},
+		{name: "mixed object formats", head: strings.Repeat("a", 40), base: strings.Repeat("b", 64), architecture: "linux/amd64"},
+		{name: "non Linux architecture", head: strings.Repeat("a", 40), base: strings.Repeat("b", 40), architecture: "darwin/arm64"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			entropy := bytes.NewReader(bytes.Repeat([]byte{1}, 64))
+			if _, err := issue(testPolicy(), test.head, test.base, test.architecture, now, entropy); !errors.Is(err, ErrInvalidGrant) {
+				t.Fatalf("issue error = %v, want ErrInvalidGrant", err)
+			}
+		})
+	}
+}
+
+func TestStoreEnforcesRunLifecycle(t *testing.T) {
+	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+	grant := testGrant(t, now)
+	store := NewStore(t.TempDir())
+	created, err := store.Create(grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Status != StatusIssued {
+		t.Fatalf("created status = %q, want %q", created.Status, StatusIssued)
+	}
+	if _, err := store.Create(grant); !errors.Is(err, ErrLifecycleConflict) {
+		t.Fatalf("duplicate create error = %v, want ErrLifecycleConflict", err)
+	}
+	if _, err := store.MarkConsumed(grant.ID, now.Add(time.Minute)); !errors.Is(err, ErrLifecycleConflict) {
+		t.Fatalf("early consume error = %v, want ErrLifecycleConflict", err)
+	}
+
+	receiptDigest := attestation.Digest([]byte("receipt-a"))
+	submitted, err := store.MarkSubmitted(grant.ID, receiptDigest, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if submitted.Status != StatusSubmitted || submitted.ReceiptDigest != receiptDigest || submitted.SubmittedAt == nil {
+		t.Fatalf("submitted record = %+v", submitted)
+	}
+	if _, err := store.MarkSubmitted(grant.ID, receiptDigest, now.Add(2*time.Minute)); err != nil {
+		t.Fatalf("idempotent submission: %v", err)
+	}
+	if _, err := store.MarkSubmitted(grant.ID, attestation.Digest([]byte("receipt-b")), now.Add(2*time.Minute)); !errors.Is(err, ErrLifecycleConflict) {
+		t.Fatalf("replacement submission error = %v, want ErrLifecycleConflict", err)
+	}
+
+	consumed, err := store.MarkConsumed(grant.ID, now.Add(3*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumed.Status != StatusConsumed || consumed.ConsumedAt == nil {
+		t.Fatalf("consumed record = %+v", consumed)
+	}
+	if _, err := store.MarkConsumed(grant.ID, now.Add(4*time.Minute)); err != nil {
+		t.Fatalf("idempotent consumption: %v", err)
+	}
+}
+
+func TestStoreRejectsExpiredOrConflictingSubmission(t *testing.T) {
+	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+	grant := testGrant(t, now)
+	store := NewStore(t.TempDir())
+	if _, err := store.Create(grant); err != nil {
+		t.Fatal(err)
+	}
+
+	expired, found, err := store.Lookup(grant.ID, grant.ExpiresAt)
+	if err != nil || !found || expired.Status != StatusExpired {
+		t.Fatalf("expired lookup = %+v, %v, %v", expired, found, err)
+	}
+	if _, err := store.MarkSubmitted(grant.ID, attestation.Digest([]byte("receipt")), grant.ExpiresAt); !errors.Is(err, ErrGrantExpired) {
+		t.Fatalf("expired submission error = %v, want ErrGrantExpired", err)
+	}
+	grant2 := testGrantWithEntropy(t, now, 4)
+	if _, err := store.Create(grant2); err != nil {
+		t.Fatal(err)
+	}
+	receiptDigest := attestation.Digest([]byte("accepted-receipt"))
+	if _, err := store.MarkSubmitted(grant2.ID, receiptDigest, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkSubmitted(grant2.ID, receiptDigest, grant2.ExpiresAt); !errors.Is(err, ErrGrantExpired) {
+		t.Fatalf("expired idempotent submission error = %v, want ErrGrantExpired", err)
+	}
+	if _, err := store.MarkConsumed(grant2.ID, grant2.ExpiresAt); !errors.Is(err, ErrGrantExpired) {
+		t.Fatalf("expired consumption error = %v, want ErrGrantExpired", err)
+	}
+	if _, err := store.MarkSubmitted(grant.ID, attestation.Digest([]byte("early")), now.Add(-time.Second)); !errors.Is(err, ErrLifecycleConflict) {
+		t.Fatalf("pre-issuance submission error = %v, want ErrLifecycleConflict", err)
+	}
+	if _, err := store.MarkSubmitted("missing", attestation.Digest([]byte("receipt")), now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing submission error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestStoreRequiresProvisionedRoot(t *testing.T) {
+	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+	root := filepath.Join(t.TempDir(), "missing")
+	if _, err := NewStore(root).Create(testGrant(t, now)); err == nil || !strings.Contains(err.Error(), "inspect run grant root") {
+		t.Fatalf("unprovisioned root error = %v", err)
+	}
+}
+
+func TestStoreRejectsTamperedStateAndConcurrentMutation(t *testing.T) {
+	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+	grant := testGrant(t, now)
+	store := NewStore(t.TempDir())
+	if _, err := store.Create(grant); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.OpenFile(store.lockPath(grant.ID), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkSubmitted(grant.ID, attestation.Digest([]byte("receipt")), now); !errors.Is(err, ErrConcurrentMutation) {
+		t.Fatalf("concurrent mutation error = %v, want ErrConcurrentMutation", err)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	record, err := store.load(grant.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Grant.Policy.Environment = "unapproved"
+	if err := writeAtomic(store.recordPath(grant.ID), record); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Lookup(grant.ID, now); !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("tampered state error = %v, want ErrInvalidGrant", err)
+	}
+}
+
+func testGrant(t *testing.T, now time.Time) Grant {
+	t.Helper()
+	return testGrantWithEntropy(t, now, 3)
+}
+
+func testGrantWithEntropy(t *testing.T, now time.Time, value byte) Grant {
+	t.Helper()
+	entropy := bytes.NewReader(append(bytes.Repeat([]byte{value}, 32), bytes.Repeat([]byte{value + 1}, 32)...))
+	grant, err := issue(testPolicy(), strings.Repeat("a", 40), strings.Repeat("b", 40), "linux/amd64", now, entropy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return grant
+}
+
+func testPolicy() policy.Policy {
+	return policy.Policy{
+		Version:        policy.Version,
+		Repository:     "github.com/acme/project",
+		Profile:        "verify",
+		Command:        []string{"go", "test", "./..."},
+		Environment:    "oci://registry.example/ci@sha256:" + strings.Repeat("c", 64),
+		MaxAgeSeconds:  3600,
+		TimeoutSeconds: 300,
+	}
+}

@@ -38,6 +38,9 @@ A signature proves who made a claim. Isolation and policy determine whether that
 | Forged GitHub webhook | Verify `X-Hub-Signature-256`, delivery freshness, and expected event/repository. |
 | Signing key compromised | Support key IDs, revocation, rotation, short receipt expiry, and audit logs. |
 | Stale or duplicated delivery | Use idempotency keys and a server-issued nonce; make check publication monotonic. |
+| Repository requests a weaker run | Issue grants only from administrator-owned policy and server-resolved GitHub revisions; repository input supplies no command, environment, expiry, or nonce. |
+| Grant ID or nonce leaks | Treat both as proof bindings rather than credentials; require a separately authenticated producer channel for issuance and submission. |
+| Receipt races or replaces another receipt | Persist the grant before execution and bind the first verified receipt digest through a locked, monotonic lifecycle. |
 | Logs altered after execution | Sign log and artifact digests; verify content before display or download. |
 | Invalid proof accidentally authorizes merge | Invalid, missing, ambiguous, or unsupported evidence always enters fallback. |
 

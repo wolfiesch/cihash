@@ -39,7 +39,7 @@ The App private key, webhook secret, and receipt-signing key are separate creden
 }
 ```
 
-Relative paths resolve from the configuration file's directory. Keep secrets out of this file.
+Relative paths resolve from the configuration file's directory. Keep secrets out of this file. Provision `stateDirectory` before starting the service; run-grant durability treats that directory as an existing administrator-owned boundary.
 
 Supply credentials through the service environment:
 
@@ -64,6 +64,25 @@ cihash serve --config ./hosted.json
 ```
 
 Expose only the configured webhook path through the deployment proxy. GitHub sends `X-Hub-Signature-256`; CIHash verifies the HMAC before parsing or recording the delivery.
+
+## Run grant boundary
+
+The v0.1 control-plane protocol issues one persisted run grant for one exact
+head/base pair and the configured administrator-owned policy. The returned
+grant includes the approved command and immutable environment identity so the
+producer does not read verification authority from the submitted tree. A
+distinct server nonce binds the resulting receipt to the grant.
+
+Grant state moves only from `issued` to `submitted` to `consumed`. Initial
+submission and consumption must both occur before expiry. Expired grants,
+replacement receipt digests, and out-of-order transitions fail closed.
+Repeating the same verified receipt submission or consumption is idempotent
+only while the grant remains valid.
+
+The run ID and nonce do not authenticate a producer. The authenticated issuance
+and receipt-submission HTTP endpoints are separate hosted-service work; until
+those endpoints are enabled, the grant contract and lifecycle are internal and
+do not expose a network authorization surface.
 
 ## Pull-request decision flow
 

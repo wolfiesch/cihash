@@ -55,6 +55,35 @@ future authorization path must retrieve and fully validate both referenced
 receipts for freshness, nonce and replay state, exact policy and job set,
 success, signer independence, and evidence availability.
 
+## Run authorization
+
+Before trusted execution, the control plane creates a
+`https://cihash.dev/run-grant/v0.1` grant from administrator-controlled policy
+and GitHub state resolved by the server. Submitted repository code does not
+choose the command, environment, policy, base, expiry, or nonce.
+
+The grant records:
+
+- an unpredictable 32-byte run ID and a distinct 32-byte nonce;
+- the exact head and base Git object IDs;
+- the complete approved policy plus its policy, workflow, and environment
+  digests;
+- the explicit Linux execution architecture; and
+- server issuance and expiry times, with the validity window fixed by the
+  approved policy.
+
+The server persists the grant before returning it. Its lifecycle is monotonic:
+`issued` becomes `submitted` after a verified receipt is bound to the run, then
+becomes `consumed` after the GitHub decision uses that receipt. Submission and
+consumption must both occur before expiry. One receipt digest may be submitted
+idempotently while valid; a different digest, an early timestamp, a late
+transition, or consumption before submission is rejected.
+
+The run ID and nonce are proof bindings, not client authentication credentials.
+Receipt submission requires a separate authenticated producer channel. The
+grant JSON is not itself signed; the server-owned stored record is authoritative,
+and receipt acceptance compares the signed predicate to that record.
+
 ## Statement
 
 The decoded payload is an in-toto Statement v1:
