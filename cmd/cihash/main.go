@@ -9,12 +9,19 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
+	"net"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/wolfiesch/cihash/internal/attestation"
+	"github.com/wolfiesch/cihash/internal/githubapi"
 	"github.com/wolfiesch/cihash/internal/githubapp"
+	"github.com/wolfiesch/cihash/internal/hosted"
 	"github.com/wolfiesch/cihash/internal/policy"
 	"github.com/wolfiesch/cihash/internal/runner"
 	"github.com/wolfiesch/cihash/internal/store"
@@ -51,6 +58,8 @@ func execute(arguments []string, output io.Writer) *commandError {
 		return verifyCommand(arguments[1:], output)
 	case "check":
 		return checkCommand(arguments[1:], output)
+	case "serve":
+		return serveCommand(arguments[1:], output)
 	case "version":
 		fmt.Fprintln(output, version)
 		return nil
@@ -211,7 +220,7 @@ func verifyCommand(arguments []string, output io.Writer) *commandError {
 	if err != nil {
 		return operationalError(err)
 	}
-	expected, err := expectedFromPolicy(configured, *head, *base, *nonce)
+	expected, err := verifier.ExpectedFromPolicy(configured, *head, *base, *nonce, time.Now().UTC())
 	if err != nil {
 		return operationalError(err)
 	}
@@ -253,7 +262,7 @@ func checkCommand(arguments []string, output io.Writer) *commandError {
 	if err != nil {
 		return operationalError(err)
 	}
-	expected, err := expectedFromPolicy(configured, *head, *base, *nonce)
+	expected, err := verifier.ExpectedFromPolicy(configured, *head, *base, *nonce, time.Now().UTC())
 	if err != nil {
 		return operationalError(err)
 	}
@@ -267,29 +276,98 @@ func checkCommand(arguments []string, output io.Writer) *commandError {
 	return nil
 }
 
-func expectedFromPolicy(configured policy.Policy, head, base, nonce string) (verifier.Expected, error) {
-	policyDigest, err := configured.Digest()
-	if err != nil {
-		return verifier.Expected{}, err
+func serveCommand(arguments []string, output io.Writer) *commandError {
+	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	configPath := flags.String("config", "", "hosted service configuration")
+	checkConfig := flags.Bool("check-config", false, "validate configuration and credentials without listening")
+	if err := flags.Parse(arguments); err != nil {
+		return usageError(err)
 	}
-	workflowDigest, err := configured.WorkflowDigest()
-	if err != nil {
-		return verifier.Expected{}, err
+	if *configPath == "" {
+		return usageError(errors.New("--config is required"))
 	}
-	return verifier.Expected{
-		Repository:        configured.Repository,
-		HeadSHA:           head,
-		BaseSHA:           base,
-		Profile:           configured.Profile,
-		PolicyDigest:      policyDigest,
-		WorkflowDigest:    workflowDigest,
-		EnvironmentDigest: configured.EnvironmentDigest(),
-		Command:           append([]string(nil), configured.Command...),
-		RequiredJobs:      []string{configured.Profile},
-		Nonce:             nonce,
-		MaxAge:            time.Duration(configured.MaxAgeSeconds) * time.Second,
-		Now:               time.Now().UTC(),
-	}, nil
+	configured, err := hosted.LoadConfig(*configPath)
+	if err != nil {
+		return operationalError(err)
+	}
+	clientID := os.Getenv("CIHASH_GITHUB_CLIENT_ID")
+	privateKeyPath := os.Getenv("CIHASH_GITHUB_PRIVATE_KEY_PATH")
+	webhookSecret := os.Getenv("CIHASH_GITHUB_WEBHOOK_SECRET")
+	if clientID == "" || privateKeyPath == "" || webhookSecret == "" {
+		return operationalError(errors.New("CIHASH_GITHUB_CLIENT_ID, CIHASH_GITHUB_PRIVATE_KEY_PATH, and CIHASH_GITHUB_WEBHOOK_SECRET are required"))
+	}
+	privateKey, err := githubapi.LoadRSAPrivateKey(privateKeyPath)
+	if err != nil {
+		return operationalError(err)
+	}
+	githubClient, err := githubapi.New(configured.GitHubAPIBaseURL, clientID, privateKey, nil)
+	if err != nil {
+		return operationalError(err)
+	}
+	configuredPolicy, _, err := policy.Load(configured.PolicyFile)
+	if err != nil {
+		return operationalError(err)
+	}
+	receiptPublicKey, err := attestation.LoadPublicKey(configured.ReceiptPublicKeyFile)
+	if err != nil {
+		return operationalError(err)
+	}
+	logger := log.New(os.Stderr, "cihash: ", log.LstdFlags|log.LUTC)
+	webhookServer, err := hosted.NewServer(configured, []byte(webhookSecret), configuredPolicy, receiptPublicKey, githubClient, logger)
+	if err != nil {
+		return operationalError(err)
+	}
+	if *checkConfig {
+		return writeJSON(output, map[string]any{
+			"listen":      configured.Listen,
+			"mode":        configured.Mode,
+			"repository":  configured.Repository,
+			"webhookPath": configured.WebhookPath,
+			"valid":       true,
+		})
+	}
+
+	listener, err := net.Listen("tcp", configured.Listen)
+	if err != nil {
+		return operationalError(fmt.Errorf("listen on %s: %w", configured.Listen, err))
+	}
+	httpServer := &http.Server{
+		Handler:           webhookServer.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := writeJSON(output, map[string]any{
+		"listen":      listener.Addr().String(),
+		"mode":        configured.Mode,
+		"repository":  configured.Repository,
+		"webhookPath": configured.WebhookPath,
+	}); err != nil {
+		_ = listener.Close()
+		return err
+	}
+	signalContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	serverError := make(chan error, 1)
+	go func() {
+		serverError <- httpServer.Serve(listener)
+	}()
+	select {
+	case err := <-serverError:
+		if !errors.Is(err, http.ErrServerClosed) {
+			return operationalError(err)
+		}
+		return nil
+	case <-signalContext.Done():
+		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownContext); err != nil {
+			return operationalError(fmt.Errorf("shut down hosted service: %w", err))
+		}
+		return nil
+	}
 }
 
 func newNonce() (string, error) {
@@ -326,5 +404,5 @@ func operationalError(err error) *commandError {
 }
 
 func printUsage(output io.Writer) {
-	fmt.Fprintln(output, "usage: cihash <keygen|policy|run|verify|check|version> [options]")
+	fmt.Fprintln(output, "usage: cihash <keygen|policy|run|verify|check|serve|version> [options]")
 }

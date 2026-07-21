@@ -1,0 +1,57 @@
+name: CIHash fallback
+run-name: cihash-${{ inputs.cihash_fallback_id }}-${{ inputs.cihash_head_sha }}-${{ inputs.cihash_base_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      cihash_fallback_id:
+        description: CIHash fallback correlation ID
+        required: true
+        type: string
+      cihash_head_sha:
+        description: Exact pull-request head commit
+        required: true
+        type: string
+      cihash_base_sha:
+        description: Exact trusted base commit
+        required: true
+        type: string
+      cihash_external_id:
+        description: CIHash check identity
+        required: true
+        type: string
+      cihash_policy_digest:
+        description: Approved CIHash policy digest
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CIHASH_HEAD_SHA: ${{ inputs.cihash_head_sha }}
+      CIHASH_BASE_SHA: ${{ inputs.cihash_base_sha }}
+    steps:
+      - name: Check out trusted base
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          ref: ${{ inputs.cihash_base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare exact merge tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CIHASH_BASE_SHA"
+          git fetch --no-tags origin "$CIHASH_HEAD_SHA"
+          git checkout --detach --force "$CIHASH_HEAD_SHA"
+          git -c user.name=CIHash -c user.email=cihash@example.invalid \
+            merge --no-commit --no-ff --no-verify "$CIHASH_BASE_SHA"
+
+      - name: Verify
+        run: go test ./...

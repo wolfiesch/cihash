@@ -23,6 +23,7 @@ type CheckRunRequest struct {
 	Status     string         `json:"status"`
 	Conclusion string         `json:"conclusion,omitempty"`
 	ExternalID string         `json:"external_id,omitempty"`
+	DetailsURL string         `json:"details_url,omitempty"`
 	Output     CheckRunOutput `json:"output"`
 }
 
@@ -52,14 +53,14 @@ func Evaluate(receiptStore store.Store, publicKey ed25519.PublicKey, expected ve
 	}
 	envelope, receiptPath, found, err := receiptStore.Lookup(identity)
 	if err != nil {
-		return rejectedResult(mode, expected.HeadSHA, "malformed_receipt", err.Error(), receiptPath)
+		return rejectedResult(mode, expected.HeadSHA, "malformed_receipt", err.Error(), receiptPath, identity)
 	}
 	if !found {
-		return rejectedResult(mode, expected.HeadSHA, "proof_missing", "no proof matches the required identity", receiptPath)
+		return rejectedResult(mode, expected.HeadSHA, "proof_missing", "no proof matches the required identity", receiptPath, identity)
 	}
 	decision := verifier.Verify(envelope, publicKey, expected)
 	if !decision.Accepted {
-		return rejectedResult(mode, expected.HeadSHA, decision.Code, decision.Message, receiptPath)
+		return rejectedResult(mode, expected.HeadSHA, decision.Code, decision.Message, receiptPath, identity)
 	}
 	return Result{
 		Accepted:    true,
@@ -80,14 +81,15 @@ func Evaluate(receiptStore store.Store, publicKey ed25519.PublicKey, expected ve
 	}
 }
 
-func rejectedResult(mode Mode, headSHA, code, message, receiptPath string) Result {
+func rejectedResult(mode Mode, headSHA, code, message, receiptPath string, identity store.Identity) Result {
 	result := Result{
 		Code:        code,
 		Message:     message,
 		ReceiptPath: receiptPath,
 		CheckRun: CheckRunRequest{
-			Name:    CheckName,
-			HeadSHA: headSHA,
+			Name:       CheckName,
+			HeadSHA:    headSHA,
+			ExternalID: externalID(identity),
 			Output: CheckRunOutput{
 				Title:   "CIHash proof not accepted",
 				Summary: fmt.Sprintf("%s: %s", code, message),
