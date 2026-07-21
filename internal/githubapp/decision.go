@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/wolfiesch/cihash/internal/acceptance"
+	"github.com/wolfiesch/cihash/internal/attestation"
 	"github.com/wolfiesch/cihash/internal/store"
 	"github.com/wolfiesch/cihash/internal/verifier"
 )
@@ -48,8 +49,22 @@ func Evaluate(receiptStore store.Store, publicKey ed25519.PublicKey, expected ve
 		acceptance.Ed25519Evaluator{PublicKey: publicKey},
 		expected,
 	)
+	return resultFromAcceptance(decision, expected, mode)
+}
+
+func EvaluateEnvelope(envelope attestation.Envelope, receiptPath string, publicKey ed25519.PublicKey, expected verifier.Expected, mode Mode) Result {
+	decision := acceptance.EvaluateEnvelope(
+		envelope,
+		receiptPath,
+		acceptance.Ed25519Evaluator{PublicKey: publicKey},
+		expected,
+	)
+	return resultFromAcceptance(decision, expected, mode)
+}
+
+func resultFromAcceptance(decision acceptance.Result, expected verifier.Expected, mode Mode) Result {
 	if !decision.Accepted {
-		return rejectedResult(mode, expected.HeadSHA, decision.Code, decision.Message, decision.ReceiptPath, decision.Identity)
+		return Rejected(mode, expected, decision.Code, decision.Message, decision.ReceiptPath)
 	}
 	return Result{
 		Accepted:    true,
@@ -68,6 +83,10 @@ func Evaluate(receiptStore store.Store, publicKey ed25519.PublicKey, expected ve
 			},
 		},
 	}
+}
+
+func Rejected(mode Mode, expected verifier.Expected, code, message, receiptPath string) Result {
+	return rejectedResult(mode, expected.HeadSHA, code, message, receiptPath, acceptance.IdentityFromExpected(expected))
 }
 
 func rejectedResult(mode Mode, headSHA, code, message, receiptPath string, identity store.Identity) Result {

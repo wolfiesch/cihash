@@ -84,6 +84,7 @@ func storedProof(t *testing.T) (store.Store, ed25519.PublicKey, verifier.Expecte
 		PolicyDigest:      result.PolicyDigest,
 		WorkflowDigest:    result.WorkflowDigest,
 		EnvironmentDigest: result.EnvironmentDigest,
+		Architecture:      result.Architecture,
 		Command:           command,
 		RequiredJobs:      []string{"verify"},
 		Nonce:             result.Nonce,

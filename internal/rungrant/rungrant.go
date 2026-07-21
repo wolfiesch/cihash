@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
 	"github.com/wolfiesch/cihash/internal/attestation"
@@ -28,16 +27,17 @@ type Grant struct {
 	Architecture      string        `json:"architecture"`
 	HeadSHA           string        `json:"headSha"`
 	BaseSHA           string        `json:"baseSha"`
+	TreeSHA           string        `json:"treeSha"`
 	Nonce             string        `json:"nonce"`
 	IssuedAt          time.Time     `json:"issuedAt"`
 	ExpiresAt         time.Time     `json:"expiresAt"`
 }
 
-func Issue(configuredPolicy policy.Policy, headSHA, baseSHA, architecture string, now time.Time) (Grant, error) {
-	return issue(configuredPolicy, headSHA, baseSHA, architecture, now, rand.Reader)
+func Issue(configuredPolicy policy.Policy, headSHA, baseSHA, treeSHA string, now time.Time) (Grant, error) {
+	return issue(configuredPolicy, headSHA, baseSHA, treeSHA, now, rand.Reader)
 }
 
-func issue(configuredPolicy policy.Policy, headSHA, baseSHA, architecture string, now time.Time, entropy io.Reader) (Grant, error) {
+func issue(configuredPolicy policy.Policy, headSHA, baseSHA, treeSHA string, now time.Time, entropy io.Reader) (Grant, error) {
 	if err := configuredPolicy.Validate(); err != nil {
 		return Grant{}, fmt.Errorf("%w: %v", ErrInvalidGrant, err)
 	}
@@ -65,10 +65,11 @@ func issue(configuredPolicy policy.Policy, headSHA, baseSHA, architecture string
 		PolicyDigest:      policyDigest,
 		WorkflowDigest:    workflowDigest,
 		EnvironmentDigest: configuredPolicy.EnvironmentDigest(),
-		Architecture:      architecture,
+		Architecture:      configuredPolicy.Environment.Platform,
 		HeadSHA:           headSHA,
 		BaseSHA:           baseSHA,
 		Nonce:             nonce,
+		TreeSHA:           treeSHA,
 		IssuedAt:          now,
 		ExpiresAt:         now.Add(time.Duration(configuredPolicy.MaxAgeSeconds) * time.Second),
 	}
@@ -91,11 +92,15 @@ func (grant Grant) Validate() error {
 	if err := grant.Policy.Validate(); err != nil {
 		return invalid(err.Error())
 	}
-	if !validGitObjectID(grant.HeadSHA) || !validGitObjectID(grant.BaseSHA) || len(grant.HeadSHA) != len(grant.BaseSHA) {
-		return invalid("head and base must use matching Git object IDs")
+	if !validGitObjectID(grant.HeadSHA) ||
+		!validGitObjectID(grant.BaseSHA) ||
+		!validGitObjectID(grant.TreeSHA) ||
+		len(grant.HeadSHA) != len(grant.BaseSHA) ||
+		len(grant.HeadSHA) != len(grant.TreeSHA) {
+		return invalid("head, base, and tree must use matching Git object IDs")
 	}
-	if !validArchitecture(grant.Architecture) {
-		return invalid("architecture must be an explicit Linux target")
+	if grant.Architecture != grant.Policy.Environment.Platform {
+		return invalid("architecture does not match the approved environment")
 	}
 	if grant.IssuedAt.IsZero() || !grant.ExpiresAt.After(grant.IssuedAt) {
 		return invalid("grant validity window is invalid")
@@ -138,23 +143,6 @@ func randomValue(source io.Reader) (string, error) {
 func validRandomValue(value string) bool {
 	decoded, err := base64.RawURLEncoding.DecodeString(value)
 	return err == nil && len(decoded) == 32
-}
-
-func validArchitecture(value string) bool {
-	parts := strings.Split(value, "/")
-	if len(parts) != 2 || parts[0] != "linux" || parts[1] == "" {
-		return false
-	}
-	for index := range len(parts[1]) {
-		character := parts[1][index]
-		if (character < '0' || character > '9') &&
-			(character < 'a' || character > 'z') &&
-			(character < 'A' || character > 'Z') &&
-			character != '-' && character != '_' && character != '.' {
-			return false
-		}
-	}
-	return true
 }
 
 func validGitObjectID(value string) bool {

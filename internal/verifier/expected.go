@@ -26,6 +26,7 @@ func ExpectedFromPolicy(configured policy.Policy, head, base, nonce string, now 
 		PolicyDigest:      policyDigest,
 		WorkflowDigest:    workflowDigest,
 		EnvironmentDigest: configured.EnvironmentDigest(),
+		Architecture:      configured.Environment.Platform,
 		Command:           append([]string(nil), configured.Command...),
 		RequiredJobs:      []string{configured.Profile},
 		Nonce:             nonce,

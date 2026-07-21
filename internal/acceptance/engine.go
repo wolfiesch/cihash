@@ -53,6 +53,11 @@ func Evaluate(source ProofSource, evaluator TrustEvaluator, expected verifier.Ex
 	if !found {
 		return rejected(identity, receiptPath, "proof_missing", "no proof matches the required identity")
 	}
+	return EvaluateEnvelope(envelope, receiptPath, evaluator, expected)
+}
+
+func EvaluateEnvelope(envelope attestation.Envelope, receiptPath string, evaluator TrustEvaluator, expected verifier.Expected) Result {
+	identity := IdentityFromExpected(expected)
 	decision := evaluator.Verify(envelope, expected)
 	if !decision.Accepted {
 		if decision.Code == "" {

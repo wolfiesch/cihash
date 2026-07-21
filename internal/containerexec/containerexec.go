@@ -3,6 +3,7 @@ package containerexec
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,17 +14,22 @@ import (
 )
 
 var (
-	imagePattern  = regexp.MustCompile(`^(?:[a-z0-9][a-z0-9._/-]*@)?sha256:[0-9a-f]{64}$`)
-	memoryPattern = regexp.MustCompile(`^[1-9][0-9]*[mg]$`)
+	imagePattern    = regexp.MustCompile(`^(?:[a-z0-9][a-z0-9._/-]*@)?sha256:[0-9a-f]{64}$`)
+	memoryPattern   = regexp.MustCompile(`^[1-9][0-9]*[mg]$`)
+	platformPattern = regexp.MustCompile(`^linux/(?:amd64|arm64)$`)
 )
+
+var ErrInvalidOptions = errors.New("invalid container options")
 
 const (
 	DefaultPIDsLimit      = 1024
 	DefaultMaxOutputBytes = int64(16 << 20)
+	DefaultPlatform       = "linux/amd64"
 )
 
 type Options struct {
 	Image          string
+	Platform       string
 	Network        string
 	Memory         string
 	CPUs           string
@@ -46,7 +52,7 @@ func Run(ctx context.Context, options Options) ([]byte, error) {
 		maxOutputBytes = DefaultMaxOutputBytes
 	}
 	if maxOutputBytes < 1 {
-		return nil, fmt.Errorf("container output limit must be positive")
+		return nil, invalidOptions("container output limit must be positive")
 	}
 	docker := options.DockerBinary
 	if docker == "" {
@@ -98,38 +104,45 @@ func (output *boundedOutput) Bytes() []byte {
 
 func dockerArguments(options Options) ([]string, string, error) {
 	if !imagePattern.MatchString(options.Image) {
-		return nil, "", fmt.Errorf("container image must be pinned by sha256 digest")
+		return nil, "", invalidOptions("container image must be pinned by sha256 digest")
+	}
+	platform := options.Platform
+	if platform == "" {
+		platform = DefaultPlatform
+	}
+	if !platformPattern.MatchString(platform) {
+		return nil, "", invalidOptions("container platform must be linux/amd64 or linux/arm64")
 	}
 	if options.Network != "none" && options.Network != "bridge" {
-		return nil, "", fmt.Errorf("container network must be none or bridge")
+		return nil, "", invalidOptions("container network must be none or bridge")
 	}
 	if !memoryPattern.MatchString(options.Memory) {
-		return nil, "", fmt.Errorf("container memory must use a positive m or g suffix")
+		return nil, "", invalidOptions("container memory must use a positive m or g suffix")
 	}
 	cpus, err := strconv.ParseFloat(options.CPUs, 64)
 	if err != nil || cpus <= 0 {
-		return nil, "", fmt.Errorf("container CPUs must be positive")
+		return nil, "", invalidOptions("container CPUs must be positive")
 	}
 	pidsLimit := options.PIDsLimit
 	if pidsLimit == 0 {
 		pidsLimit = DefaultPIDsLimit
 	}
 	if pidsLimit < 1 {
-		return nil, "", fmt.Errorf("container PID limit must be positive")
+		return nil, "", invalidOptions("container PID limit must be positive")
 	}
 	if len(options.Command) == 0 || strings.TrimSpace(options.Command[0]) == "" {
-		return nil, "", fmt.Errorf("container command is required")
+		return nil, "", invalidOptions("container command is required")
 	}
 	directory, err := filepath.Abs(options.Directory)
 	if err != nil {
-		return nil, "", fmt.Errorf("resolve container workspace: %w", err)
+		return nil, "", invalidOptions("resolve container workspace: %v", err)
 	}
 	info, err := os.Stat(directory)
 	if err != nil {
-		return nil, "", fmt.Errorf("inspect container workspace: %w", err)
+		return nil, "", invalidOptions("inspect container workspace: %v", err)
 	}
 	if !info.IsDir() {
-		return nil, "", fmt.Errorf("container workspace must be a directory")
+		return nil, "", invalidOptions("container workspace must be a directory")
 	}
 	cidFile, err := temporaryCIDFile()
 	if err != nil {
@@ -140,6 +153,7 @@ func dockerArguments(options Options) ([]string, string, error) {
 	arguments := []string{
 		"run", "--rm", "--pull=never", "--init",
 		"--cidfile", cidFile,
+		"--platform=" + platform,
 		"--read-only",
 		"--cap-drop=ALL",
 		"--security-opt=no-new-privileges:true",
@@ -162,6 +176,10 @@ func dockerArguments(options Options) ([]string, string, error) {
 		options.Image,
 	}
 	return append(arguments, options.Command...), cidFile, nil
+}
+
+func invalidOptions(format string, arguments ...any) error {
+	return fmt.Errorf("%w: %s", ErrInvalidOptions, fmt.Sprintf(format, arguments...))
 }
 
 func temporaryCIDFile() (string, error) {

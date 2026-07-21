@@ -52,6 +52,14 @@ type PullRequestState struct {
 	HeadRepository string
 	BaseSHA        string
 	BaseRef        string
+	TreeSHA        string
+}
+type WorkflowJob struct {
+	ID          int64
+	Name        string
+	Conclusion  string
+	StartedAt   time.Time
+	CompletedAt time.Time
 }
 
 func New(baseURL, clientID string, privateKey *rsa.PrivateKey, httpClient *http.Client) (*Client, error) {
@@ -120,6 +128,7 @@ func (client *Client) InstallationToken(ctx context.Context, installationID int6
 	}{
 		Repositories: []string{repositoryName},
 		Permissions: map[string]string{
+			"contents":      "read",
 			"actions":       "write",
 			"checks":        "write",
 			"pull_requests": "read",
@@ -157,6 +166,7 @@ func (client *Client) GetPullRequest(ctx context.Context, token, repository stri
 			SHA string `json:"sha"`
 			Ref string `json:"ref"`
 		} `json:"base"`
+		MergeCommitSHA string `json:"merge_commit_sha"`
 	}
 	path := "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/pulls/" + strconv.FormatInt(number, 10)
 	if err := client.do(ctx, http.MethodGet, path, token, nil, http.StatusOK, &response); err != nil {
@@ -165,11 +175,36 @@ func (client *Client) GetPullRequest(ctx context.Context, token, repository stri
 	if response.Head.SHA == "" || response.Head.Repo.FullName == "" || response.Base.SHA == "" || response.Base.Ref == "" {
 		return PullRequestState{}, fmt.Errorf("GitHub returned incomplete pull request identity")
 	}
+	if !validGitObjectID(response.Head.SHA) || !validGitObjectID(response.Base.SHA) {
+		return PullRequestState{}, fmt.Errorf("GitHub returned malformed pull request identity")
+	}
+	if response.MergeCommitSHA == "" {
+		return PullRequestState{}, fmt.Errorf("GitHub has no merge commit for pull request")
+	}
+	if !validGitObjectID(response.MergeCommitSHA) {
+		return PullRequestState{}, fmt.Errorf("GitHub returned malformed pull request merge commit SHA")
+	}
+	var mergeCommit struct {
+		Tree struct {
+			SHA string `json:"sha"`
+		} `json:"tree"`
+	}
+	mergeCommitPath := "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/git/commits/" + url.PathEscape(response.MergeCommitSHA)
+	if err := client.do(ctx, http.MethodGet, mergeCommitPath, token, nil, http.StatusOK, &mergeCommit); err != nil {
+		return PullRequestState{}, fmt.Errorf("fetch GitHub pull request merge commit: %w", err)
+	}
+	if mergeCommit.Tree.SHA == "" {
+		return PullRequestState{}, fmt.Errorf("GitHub returned no tree SHA for pull request merge commit")
+	}
+	if !validGitObjectID(mergeCommit.Tree.SHA) {
+		return PullRequestState{}, fmt.Errorf("GitHub returned malformed pull request merge tree SHA")
+	}
 	return PullRequestState{
 		HeadSHA:        response.Head.SHA,
 		HeadRepository: response.Head.Repo.FullName,
 		BaseSHA:        response.Base.SHA,
 		BaseRef:        response.Base.Ref,
+		TreeSHA:        mergeCommit.Tree.SHA,
 	}, nil
 }
 
@@ -222,6 +257,47 @@ func (client *Client) DispatchWorkflow(ctx context.Context, token, repository, w
 		return 0, fmt.Errorf("GitHub did not return a workflow run ID; fallback cannot be correlated safely")
 	}
 	return response.WorkflowRunID, nil
+}
+
+func (client *Client) GetWorkflowJob(ctx context.Context, token, repository string, runID int64, jobName string) (WorkflowJob, error) {
+	owner, name, err := splitRepository(repository)
+	if err != nil {
+		return WorkflowJob{}, err
+	}
+	if runID <= 0 || strings.TrimSpace(jobName) == "" {
+		return WorkflowJob{}, fmt.Errorf("workflow run ID and job name are required")
+	}
+	var response struct {
+		Jobs []struct {
+			ID          int64     `json:"id"`
+			Name        string    `json:"name"`
+			Status      string    `json:"status"`
+			Conclusion  string    `json:"conclusion"`
+			StartedAt   time.Time `json:"started_at"`
+			CompletedAt time.Time `json:"completed_at"`
+		} `json:"jobs"`
+	}
+	path := "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/actions/runs/" + strconv.FormatInt(runID, 10) + "/jobs?filter=latest&per_page=100"
+	if err := client.do(ctx, http.MethodGet, path, token, nil, http.StatusOK, &response); err != nil {
+		return WorkflowJob{}, err
+	}
+	var matched WorkflowJob
+	for _, job := range response.Jobs {
+		if job.Name != jobName {
+			continue
+		}
+		if matched.ID != 0 {
+			return WorkflowJob{}, fmt.Errorf("GitHub workflow run contains multiple jobs named %q", jobName)
+		}
+		if job.ID <= 0 || job.Status != "completed" || job.Conclusion == "" || job.StartedAt.IsZero() || job.CompletedAt.IsZero() || job.CompletedAt.Before(job.StartedAt) {
+			return WorkflowJob{}, fmt.Errorf("GitHub workflow job %q is incomplete", jobName)
+		}
+		matched = WorkflowJob{ID: job.ID, Name: job.Name, Conclusion: job.Conclusion, StartedAt: job.StartedAt.UTC(), CompletedAt: job.CompletedAt.UTC()}
+	}
+	if matched.ID == 0 {
+		return WorkflowJob{}, fmt.Errorf("GitHub workflow run does not contain job %q", jobName)
+	}
+	return matched, nil
 }
 
 func (client *Client) appJWT() (string, error) {
@@ -299,4 +375,19 @@ func splitRepository(repository string) (string, string, error) {
 		return "", "", fmt.Errorf("repository must be owner/name")
 	}
 	return parts[0], parts[1], nil
+}
+
+func validGitObjectID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	for index := range len(value) {
+		character := value[index]
+		if (character < '0' || character > '9') &&
+			(character < 'a' || character > 'f') &&
+			(character < 'A' || character > 'F') {
+			return false
+		}
+	}
+	return true
 }

@@ -37,26 +37,29 @@ flowchart LR
     R --> W[Network-disabled worker container]
     W --> R
     R --> K[Runner-only Ed25519 key]
-    R --> S[Signed receipt store]
-    G[GitHub webhook] --> C[Rootless CIHash service container]
-    C --> S
+    R --> A[Authenticated receipt submission]
+    A --> C[Rootless CIHash service container]
+    G[GitHub webhook] --> C
+    C --> S[Service-owned immutable evidence store]
     C --> P[GitHub App private key]
     C --> H[GitHub Checks API]
 ```
 
 The two Unix identities have different privileges:
 
-- `cihash-runner` owns the exact checkout, Docker access, worker image, and receipt signing key. The worker receives no Docker socket, signing key, GitHub credential, webhook secret, policy mount, or receipt-store mount.
-- `cihash` runs the public webhook service. Its container is read-only, capability-free, and has no Docker access. It can read signed receipts and App credentials, and can write only replay/fallback state.
+- `cihash-runner` owns the exact checkout, Docker access, worker image, and receipt signing key. The worker receives no Docker socket, signing key, GitHub credential, webhook secret, policy mount, or evidence-store mount. The runner submits signed evidence through the authenticated control-plane API.
+- `cihash` runs the public webhook and receipt-ingestion service. Its container is read-only, capability-free, and has no Docker access. It owns only the immutable evidence store and replay/fallback state, and can read App credentials.
 
-Signed receipts are group-readable evidence. Raw job logs remain readable only by `cihash-runner`. The shared store uses:
+The service-owned store uses:
 
 ```text
-/srv/cihash/receipts            2770 cihash-runner:cihash
-/srv/cihash/receipts/receipts   2750 cihash-runner:cihash
-receipt files                    0640 cihash-runner:cihash
-/srv/cihash/receipts/logs       2700 cihash-runner:cihash
-log files                        0600 cihash-runner:cihash
+/srv/cihash/receipts            0700 cihash:cihash
+/srv/cihash/receipts/receipts   2750 cihash:cihash
+receipt files                    0640 cihash:cihash
+/srv/cihash/receipts/logs       0700 cihash:cihash
+log files                        0600 cihash:cihash
+/srv/cihash/receipts/identities 0700 cihash:cihash
+/srv/cihash/receipts/runs       0700 cihash:cihash
 ```
 
 ## GitHub App configuration
@@ -79,7 +82,12 @@ Actions write permission exists only for enforce-mode fallback dispatch. Shadow 
 /srv/cihash/secrets/cihash.env
 ```
 
-`cihash.env` supplies `CIHASH_GITHUB_APP_ID`, `CIHASH_GITHUB_CLIENT_ID`, `CIHASH_GITHUB_PRIVATE_KEY_PATH`, and `CIHASH_GITHUB_WEBHOOK_SECRET`. Never print or commit their values.
+`cihash.env` supplies `CIHASH_GITHUB_CLIENT_ID`,
+`CIHASH_GITHUB_PRIVATE_KEY_PATH`, `CIHASH_GITHUB_WEBHOOK_SECRET`, and a
+random producer credential of at least 32 bytes in `CIHASH_PRODUCER_TOKEN`.
+Provision the same credential at `/srv/cihash/runner-secrets/producer-token`
+with mode `0400` and owner `cihash-runner`; never pass it on the command line,
+print it, commit it, or expose it to a workload container.
 
 ## Build and deploy
 
@@ -92,6 +100,12 @@ ssh <runner-host> 'sudo install -o cihash -g cihash -m 0755 /tmp/cihash-linux-am
 ```
 
 Update `deploy/t4-shadow/cihash.service` with the resulting immutable image digest before installing the unit. Keep the service container on `agent-webhook-hub_web`; Caddy routes `cihash.wolfie.gg` to `cihash:18080` on that network.
+
+The service root filesystem and config/secrets mounts remain read-only. The
+receipt store is the narrow writable evidence mount because the authenticated
+submission endpoint persists immutable receipts, private logs, run bindings,
+and an atomic identity pointer. Keep it owned by the `cihash` service account;
+do not expose it to the workload container.
 
 Prepare the exact PR merge tree outside the checked-out T4 working tree, then build the worker image:
 
@@ -106,7 +120,8 @@ sudo -u cihash-runner docker image inspect cihash-t4-tooling:shadow --format '{{
 
 The worker build may access package registries while resolving the frozen lockfile. The signed workload cannot: `container-exec` requires an image digest and launches it with `--network none`, a read-only root, dropped capabilities, `no-new-privileges`, and resource limits.
 
-Copy the resulting worker digest into both `command[].--image` and `environment` in `deploy/t4-shadow/policy.json`. Validate and deploy the manifests:
+Copy the resulting worker digest into `environment.image` in
+`deploy/t4-shadow/policy.json`. Validate and deploy the manifests:
 
 ```bash
 go run ./cmd/cihash policy --file deploy/t4-shadow/policy.json
@@ -116,19 +131,13 @@ ssh <runner-host> 'sudo install -o cihash -g cihash -m 0644 /tmp/policy.json /sr
 
 ## Generate and verify a proof
 
-The runner resolves the supplied commits, constructs the merge tree itself, executes the pinned policy command, signs the result, and stores the raw log separately:
+The runner requests a server-issued grant for the current pull request, independently resolves the granted commits and merge tree, executes the pinned policy command, signs the result, and submits the receipt and raw log through the authenticated ingestion endpoint:
 
 ```bash
-ssh <runner-host> 'sudo -u cihash-runner /srv/cihash/bin/cihash run --repo /srv/cihash/repository --head <head-sha> --base <base-sha> --policy /srv/cihash/config/policy.json --private-key /srv/cihash/runner-secrets/receipt-signing.pem --store /srv/cihash/receipts'
+ssh <runner-host> 'sudo -u cihash-runner /srv/cihash/bin/cihash hosted-run --server https://cihash.wolfie.gg --token-file /srv/cihash/runner-secrets/producer-token --installation <installation-id> --pull-request <pr-number> --repo /srv/cihash/repository --private-key /srv/cihash/runner-secrets/receipt-signing.pem'
 ```
 
-Verify the returned receipt with its nonce before publication:
-
-```bash
-ssh <runner-host> 'sudo -u cihash-runner /srv/cihash/bin/cihash verify --receipt <receipt-path> --policy /srv/cihash/config/policy.json --public-key /srv/cihash/runner-secrets/receipt-signing.pub.pem --head <head-sha> --base <base-sha> --nonce <nonce>'
-```
-
-An altered head, base, policy, workflow, environment, required job set, signature, nonce, or expiry must return a specific rejection and a nonzero exit status.
+The service re-verifies the signature, server nonce, exact head, base, GitHub merge tree, policy, workflow, environment, architecture, timing, complete job set, and uploaded log digest before immutable persistence. A failed workload may submit a signed diagnostic receipt, but it cannot authorize a success check. An altered binding or an unissued, expired, replayed, or conflicting run returns a nonzero status.
 
 ## Shadow evaluation
 
@@ -145,6 +154,23 @@ summary: proof matches the required code, policy, workflow, and environment
 ```
 
 Missing or invalid proof in shadow mode produces a neutral diagnostic check. It never produces success and never dispatches fallback. Replayed `X-GitHub-Delivery` values are deduplicated in `/srv/cihash/state`.
+
+The App correlates that proof decision with the exact `tooling` job from the
+configured `CI` workflow. It obtains the job conclusion and timestamps through
+the installation-scoped GitHub API rather than inferring them from the aggregate
+workflow result. Generate the machine-readable pilot report on the host:
+
+```bash
+sudo -u cihash /srv/cihash/bin/cihash lab shadow-report --state-directory /srv/cihash/state
+```
+
+The command exits nonzero until at least one comparable observation exists, all
+comparable proof decisions match the selected Actions job, no correlation is
+pending, and every comparable observation identifies an unmodified production
+service build by source revision and binary digest. A proof is comparable only
+when CIHash accepted it or rejected it because the signed run failed; missing,
+stale, malformed, and unsupported proofs remain visible but are classified as
+`not_comparable`.
 
 ## Verified demonstration
 

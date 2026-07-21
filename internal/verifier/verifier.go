@@ -15,16 +15,21 @@ type Expected struct {
 	Repository        string
 	HeadSHA           string
 	BaseSHA           string
+	TreeSHA           string
 	Profile           string
 	PolicyDigest      string
 	WorkflowDigest    string
 	EnvironmentDigest string
+	Architecture      string
 	Command           []string
 	RequiredJobs      []string
 	Nonce             string
 	MaxAge            time.Duration
 	Now               time.Time
 	ClockSkew         time.Duration
+	NotBefore         time.Time
+	IssuedAt          time.Time
+	ExpiresAt         time.Time
 }
 
 type Decision struct {
@@ -79,6 +84,9 @@ func validateStatement(statement attestation.Statement, expected Expected) Decis
 	if predicate.BaseSHA != expected.BaseSHA {
 		return reject("base_mismatch", "proof base does not match the current base commit")
 	}
+	if expected.TreeSHA != "" && predicate.TreeSHA != expected.TreeSHA {
+		return reject("tree_mismatch", "proof tree does not match the current GitHub merge tree")
+	}
 	if predicate.Profile != expected.Profile {
 		return reject("profile_mismatch", "proof profile does not match the approved profile")
 	}
@@ -90,6 +98,9 @@ func validateStatement(statement attestation.Statement, expected Expected) Decis
 	}
 	if predicate.EnvironmentDigest != expected.EnvironmentDigest {
 		return reject("environment_mismatch", "proof environment does not match the approved environment")
+	}
+	if predicate.Architecture != expected.Architecture {
+		return reject("architecture_mismatch", "proof architecture does not match the approved environment")
 	}
 	if expected.Nonce != "" && predicate.Nonce != expected.Nonce {
 		return reject("nonce_invalid", "proof nonce is not valid for this job")
@@ -113,6 +124,15 @@ func validateStatement(statement attestation.Statement, expected Expected) Decis
 	skew := expected.ClockSkew
 	if skew == 0 {
 		skew = time.Minute
+	}
+	if !expected.IssuedAt.IsZero() && !predicate.IssuedAt.Equal(expected.IssuedAt) {
+		return reject("issued_at_mismatch", "proof issue time does not match the required value")
+	}
+	if !expected.NotBefore.IsZero() && predicate.IssuedAt.Before(expected.NotBefore.Add(-skew)) {
+		return reject("issued_at_mismatch", "proof issue time predates the server-issued grant")
+	}
+	if !expected.ExpiresAt.IsZero() && !predicate.ExpiresAt.Equal(expected.ExpiresAt) {
+		return reject("expiry_mismatch", "proof expiry does not match the server-issued grant")
 	}
 	if predicate.IssuedAt.After(now.Add(skew)) {
 		return reject("not_yet_valid", "proof issue time is in the future")
@@ -145,7 +165,9 @@ func validateStatement(statement attestation.Statement, expected Expected) Decis
 		if err := attestation.ValidateDigest(job.LogDigest); err != nil {
 			return reject("malformed_receipt", "proof contains an invalid log digest")
 		}
-		if job.StartedAt.After(job.CompletedAt) || job.CompletedAt.After(predicate.IssuedAt.Add(skew)) {
+		if job.StartedAt.After(job.CompletedAt) ||
+			(!expected.NotBefore.IsZero() && job.StartedAt.Before(expected.NotBefore.Add(-skew))) ||
+			job.CompletedAt.After(predicate.IssuedAt.Add(skew)) {
 			return reject("malformed_receipt", "proof contains invalid job timestamps")
 		}
 		if job.Conclusion != "success" || job.ExitCode != 0 {

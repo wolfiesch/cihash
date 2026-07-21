@@ -9,25 +9,37 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/wolfiesch/cihash/internal/attestation"
 	"github.com/wolfiesch/cihash/internal/githubapi"
 	"github.com/wolfiesch/cihash/internal/githubapp"
 	"github.com/wolfiesch/cihash/internal/policy"
+	"github.com/wolfiesch/cihash/internal/rungrant"
+	"github.com/wolfiesch/cihash/internal/shadow"
 	"github.com/wolfiesch/cihash/internal/store"
 	"github.com/wolfiesch/cihash/internal/verifier"
 )
 
-const maxWebhookBody = 1 << 20
+const (
+	maxWebhookBody = 1 << 20
+	maxReceiptBody = 8 << 20
+	maxReceiptLog  = 4 << 20
+	runsEndpoint   = "/api/v1/runs"
+)
 
 type GitHubClient interface {
 	InstallationToken(context.Context, int64, string) (string, error)
 	GetPullRequest(context.Context, string, string, int64) (githubapi.PullRequestState, error)
+	GetWorkflowJob(context.Context, string, string, int64, string) (githubapi.WorkflowJob, error)
 	CreateCheckRun(context.Context, string, string, githubapp.CheckRunRequest) (int64, error)
 	UpdateCheckRun(context.Context, string, string, int64, githubapi.CheckRunUpdate) error
 	DispatchWorkflow(context.Context, string, string, string, githubapi.WorkflowDispatch) (int64, error)
@@ -36,10 +48,15 @@ type GitHubClient interface {
 type Server struct {
 	config        Config
 	webhookSecret []byte
+	producerToken []byte
 	policy        policy.Policy
 	publicKey     ed25519.PublicKey
 	receiptStore  store.Store
+	grantStore    rungrant.Store
 	stateStore    StateStore
+	shadowStore   shadow.Store
+	serviceBuild  serviceBuild
+	startedAt     time.Time
 	github        GitHubClient
 	logger        *log.Logger
 	now           func() time.Time
@@ -68,13 +85,15 @@ type workflowRunPayload struct {
 	Repository   repositoryPayload   `json:"repository"`
 	Installation installationPayload `json:"installation"`
 	WorkflowRun  struct {
-		ID         int64     `json:"id"`
-		Event      string    `json:"event"`
-		Status     string    `json:"status"`
-		Conclusion string    `json:"conclusion"`
-		HeadBranch string    `json:"head_branch"`
-		HeadSHA    string    `json:"head_sha"`
-		UpdatedAt  time.Time `json:"updated_at"`
+		ID           int64     `json:"id"`
+		Event        string    `json:"event"`
+		Status       string    `json:"status"`
+		Conclusion   string    `json:"conclusion"`
+		HeadBranch   string    `json:"head_branch"`
+		HeadSHA      string    `json:"head_sha"`
+		Name         string    `json:"name"`
+		RunStartedAt time.Time `json:"run_started_at"`
+		UpdatedAt    time.Time `json:"updated_at"`
 	} `json:"workflow_run"`
 }
 
@@ -86,12 +105,16 @@ type installationPayload struct {
 	ID int64 `json:"id"`
 }
 
-func NewServer(config Config, webhookSecret []byte, configuredPolicy policy.Policy, publicKey ed25519.PublicKey, github GitHubClient, logger *log.Logger) (*Server, error) {
+func NewServer(config Config, webhookSecret, producerToken []byte, configuredPolicy policy.Policy, publicKey ed25519.PublicKey, github GitHubClient, logger *log.Logger) (*Server, error) {
+	config.applyDefaults()
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
 	if len(webhookSecret) < 32 {
 		return nil, fmt.Errorf("GitHub webhook secret must contain at least 32 bytes")
+	}
+	if len(producerToken) < 32 {
+		return nil, fmt.Errorf("producer bearer token must contain at least 32 bytes")
 	}
 	if err := configuredPolicy.Validate(); err != nil {
 		return nil, err
@@ -108,13 +131,26 @@ func NewServer(config Config, webhookSecret []byte, configuredPolicy policy.Poli
 	if logger == nil {
 		logger = log.Default()
 	}
+	if err := os.MkdirAll(config.StateDirectory, 0o700); err != nil {
+		return nil, fmt.Errorf("create hosted state directory: %w", err)
+	}
+	build, err := inspectServiceBuild()
+	if err != nil {
+		return nil, err
+	}
+	startedAt := time.Now().UTC()
 	return &Server{
 		config:        config,
 		webhookSecret: append([]byte(nil), webhookSecret...),
 		policy:        configuredPolicy,
 		publicKey:     append(ed25519.PublicKey(nil), publicKey...),
+		producerToken: append([]byte(nil), producerToken...),
 		receiptStore:  store.New(config.ReceiptStore),
 		stateStore:    NewStateStore(config.StateDirectory),
+		grantStore:    rungrant.NewStore(config.StateDirectory),
+		shadowStore:   shadow.New(config.StateDirectory),
+		serviceBuild:  build,
+		startedAt:     startedAt,
 		github:        github,
 		logger:        logger,
 		now:           func() time.Time { return time.Now().UTC() },
@@ -124,11 +160,229 @@ func NewServer(config Config, webhookSecret []byte, configuredPolicy policy.Poli
 func (server *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(server.config.WebhookPath, server.handleWebhook)
+	mux.HandleFunc(runsEndpoint, server.handleRuns)
+	mux.HandleFunc(runsEndpoint+"/", server.handleReceipt)
 	mux.HandleFunc("/health", func(response http.ResponseWriter, _ *http.Request) {
 		response.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(response, `{"status":"ok"}`+"\n")
 	})
 	return mux
+}
+
+type runIssueRequest struct {
+	InstallationID    int64 `json:"installationId"`
+	PullRequestNumber int64 `json:"pullRequestNumber"`
+}
+
+type receiptSubmission struct {
+	Envelope attestation.Envelope `json:"envelope"`
+	Log      []byte               `json:"log"`
+}
+
+func (server *Server) handleRuns(response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		response.Header().Set("Allow", http.MethodPost)
+		http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !server.authorizedProducer(request) {
+		http.Error(response, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if !isJSONRequest(request) {
+		http.Error(response, "unsupported media type", http.StatusUnsupportedMediaType)
+		return
+	}
+	var issue runIssueRequest
+	if status := decodeJSONBody(response, request, maxWebhookBody, &issue); status != 0 {
+		http.Error(response, "invalid request", status)
+		return
+	}
+	if issue.InstallationID <= 0 || issue.PullRequestNumber <= 0 {
+		http.Error(response, "invalid request", http.StatusBadRequest)
+		return
+	}
+	token, err := server.github.InstallationToken(request.Context(), issue.InstallationID, server.config.Repository)
+	if err != nil {
+		server.logger.Printf("issue run installation token: %v", err)
+		http.Error(response, "GitHub state unavailable", http.StatusBadGateway)
+		return
+	}
+	current, err := server.github.GetPullRequest(request.Context(), token, server.config.Repository, issue.PullRequestNumber)
+	if err != nil {
+		server.logger.Printf("issue run pull request: %v", err)
+		http.Error(response, "GitHub state unavailable", http.StatusBadGateway)
+		return
+	}
+	if current.HeadRepository != server.config.Repository {
+		http.Error(response, "pull request is not eligible", http.StatusConflict)
+		return
+	}
+	grant, err := rungrant.Issue(server.policy, current.HeadSHA, current.BaseSHA, current.TreeSHA, server.now())
+	if err != nil {
+		server.logger.Printf("issue run grant: %v", err)
+		http.Error(response, "run issuance unavailable", http.StatusInternalServerError)
+		return
+	}
+	if _, err := server.grantStore.Create(grant); err != nil {
+		server.logger.Printf("persist run grant: %v", err)
+		http.Error(response, "run issuance unavailable", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(response, http.StatusCreated, grant)
+}
+
+func (server *Server) handleReceipt(response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		response.Header().Set("Allow", http.MethodPost)
+		http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !server.authorizedProducer(request) {
+		http.Error(response, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if !isJSONRequest(request) {
+		http.Error(response, "unsupported media type", http.StatusUnsupportedMediaType)
+		return
+	}
+	runID, ok := receiptRunID(request.URL.Path)
+	if !ok {
+		http.NotFound(response, request)
+		return
+	}
+	var submission receiptSubmission
+	if status := decodeJSONBody(response, request, maxReceiptBody, &submission); status != 0 {
+		http.Error(response, "invalid receipt submission", status)
+		return
+	}
+	if len(submission.Log) > maxReceiptLog {
+		http.Error(response, "receipt log too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	now := server.now()
+	record, found, err := server.grantStore.Lookup(runID, now)
+	if err != nil {
+		server.logger.Printf("lookup run grant: %v", err)
+		http.Error(response, "run state unavailable", http.StatusInternalServerError)
+		return
+	}
+	if !found {
+		http.NotFound(response, request)
+		return
+	}
+	if record.Status == rungrant.StatusExpired {
+		http.Error(response, "run grant expired", http.StatusGone)
+		return
+	}
+	if !now.Before(record.Grant.ExpiresAt) {
+		http.Error(response, "run grant expired", http.StatusGone)
+		return
+	}
+	expected := verifier.Expected{
+		Repository:        record.Grant.Policy.Repository,
+		HeadSHA:           record.Grant.HeadSHA,
+		TreeSHA:           record.Grant.TreeSHA,
+		BaseSHA:           record.Grant.BaseSHA,
+		Profile:           record.Grant.Policy.Profile,
+		PolicyDigest:      record.Grant.PolicyDigest,
+		WorkflowDigest:    record.Grant.WorkflowDigest,
+		EnvironmentDigest: record.Grant.EnvironmentDigest,
+		Architecture:      record.Grant.Architecture,
+		Command:           append([]string(nil), record.Grant.Policy.Command...),
+		RequiredJobs:      []string{record.Grant.Policy.Profile},
+		Nonce:             record.Grant.Nonce,
+		MaxAge:            record.Grant.ExpiresAt.Sub(record.Grant.IssuedAt),
+		NotBefore:         record.Grant.IssuedAt,
+		ExpiresAt:         record.Grant.ExpiresAt,
+		Now:               now,
+	}
+	decision := verifier.Verify(submission.Envelope, server.publicKey, expected)
+	if !decision.Accepted && decision.Code != "job_failed" && decision.Code != "proof_failed" {
+		http.Error(response, "receipt verification failed", http.StatusUnprocessableEntity)
+		return
+	}
+	logDigest := attestation.Digest(submission.Log)
+	for _, job := range decision.Statement.Predicate.Jobs {
+		if job.LogDigest != logDigest {
+			http.Error(response, "receipt log does not match", http.StatusUnprocessableEntity)
+			return
+		}
+	}
+	envelopeData, err := attestation.MarshalEnvelope(submission.Envelope)
+	if err != nil {
+		http.Error(response, "invalid receipt submission", http.StatusBadRequest)
+		return
+	}
+	receiptDigest := attestation.Digest(envelopeData)
+	if _, err := server.grantStore.MarkSubmitted(runID, receiptDigest, now); err != nil {
+		switch {
+		case errors.Is(err, rungrant.ErrGrantExpired):
+			http.Error(response, "run grant expired", http.StatusGone)
+		case errors.Is(err, rungrant.ErrLifecycleConflict):
+			http.Error(response, "receipt conflicts with run state", http.StatusConflict)
+		default:
+			server.logger.Printf("bind receipt to run: %v", err)
+			http.Error(response, "run state unavailable", http.StatusInternalServerError)
+		}
+		return
+	}
+	if _, _, err := server.receiptStore.SaveForRun(runID, store.IdentityFromResult(decision.Statement.Predicate), submission.Envelope, submission.Log); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			http.Error(response, "receipt conflicts with existing evidence", http.StatusConflict)
+			return
+		}
+		server.logger.Printf("persist receipt evidence: %v", err)
+		http.Error(response, "receipt persistence unavailable", http.StatusInternalServerError)
+		return
+	}
+	status := http.StatusOK
+	if record.Status == rungrant.StatusIssued {
+		status = http.StatusCreated
+	}
+	writeJSON(response, status, map[string]string{"receiptDigest": receiptDigest})
+}
+
+func (server *Server) authorizedProducer(request *http.Request) bool {
+	const prefix = "Bearer "
+	value := request.Header.Get("Authorization")
+	if !strings.HasPrefix(value, prefix) {
+		return false
+	}
+	candidate := sha256.Sum256([]byte(value[len(prefix):]))
+	expected := sha256.Sum256(server.producerToken)
+	return hmac.Equal(candidate[:], expected[:])
+}
+
+func receiptRunID(path string) (string, bool) {
+	parts := strings.Split(strings.TrimPrefix(path, runsEndpoint+"/"), "/")
+	return parts[0], len(parts) == 2 && parts[0] != "" && parts[1] == "receipt"
+}
+
+func decodeJSONBody(response http.ResponseWriter, request *http.Request, limit int64, destination any) int {
+	decoder := json.NewDecoder(http.MaxBytesReader(response, request.Body, limit))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return http.StatusRequestEntityTooLarge
+		}
+		return http.StatusBadRequest
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return http.StatusBadRequest
+	}
+	return 0
+}
+func isJSONRequest(request *http.Request) bool {
+	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	return err == nil && mediaType == "application/json"
+}
+
+func writeJSON(response http.ResponseWriter, status int, value any) {
+	response.Header().Set("Content-Type", "application/json")
+	response.WriteHeader(status)
+	_ = json.NewEncoder(response).Encode(value)
 }
 
 func (server *Server) handleWebhook(response http.ResponseWriter, request *http.Request) {
@@ -222,7 +476,11 @@ func (server *Server) handlePullRequest(ctx context.Context, body []byte) error 
 	if err != nil {
 		return err
 	}
-	decision := githubapp.Evaluate(server.receiptStore, server.publicKey, expected, server.config.Mode)
+	expected.TreeSHA = current.TreeSHA
+	operationStarted := time.Now()
+	verificationStarted := time.Now()
+	decision := server.evaluateBoundProof(expected)
+	verificationMillis := time.Since(verificationStarted).Milliseconds()
 	decision.CheckRun.Name = server.config.CheckName
 	if server.config.DetailsURL != "" {
 		decision.CheckRun.DetailsURL = server.config.DetailsURL
@@ -231,10 +489,120 @@ func (server *Server) handlePullRequest(ctx context.Context, body []byte) error 
 	if err != nil {
 		return err
 	}
+	if server.config.Mode == githubapp.ShadowMode {
+		evaluatedAt := server.now()
+		serviceStartedAt := server.startedAt
+		if serviceStartedAt.After(evaluatedAt) {
+			serviceStartedAt = evaluatedAt
+		}
+		if _, err := server.shadowStore.RecordDecision(shadow.Decision{
+			Repository:            server.config.Repository,
+			PullRequestNumber:     payload.Number,
+			HeadSHA:               current.HeadSHA,
+			BaseSHA:               current.BaseSHA,
+			TreeSHA:               current.TreeSHA,
+			PolicyDigest:          expected.PolicyDigest,
+			ProofAccepted:         decision.Accepted,
+			ProofCode:             decision.Code,
+			Comparable:            comparableProofDecision(decision),
+			CheckRunID:            checkRunID,
+			EvaluatedAt:           evaluatedAt,
+			VerificationMillis:    verificationMillis,
+			AppDecisionMillis:     time.Since(operationStarted).Milliseconds(),
+			ServiceSourceRevision: server.serviceBuild.sourceRevision,
+			ServiceBinaryDigest:   server.serviceBuild.binaryDigest,
+			ServiceBuildMode:      server.config.BuildMode,
+			ServiceSourceModified: server.serviceBuild.sourceModified,
+			ServiceStartedAt:      serviceStartedAt,
+			PolicyTimeoutSeconds:  server.policy.TimeoutSeconds,
+		}); err != nil {
+			return fmt.Errorf("record shadow decision: %w", err)
+		}
+	}
 	if !decision.FallbackRequired {
 		return nil
 	}
 	return server.dispatchFallback(ctx, token, payload, decision, checkRunID)
+}
+
+func (server *Server) evaluateBoundProof(identityExpected verifier.Expected) githubapp.Result {
+	identity := store.Identity{
+		Repository:        identityExpected.Repository,
+		HeadSHA:           identityExpected.HeadSHA,
+		BaseSHA:           identityExpected.BaseSHA,
+		Profile:           identityExpected.Profile,
+		PolicyDigest:      identityExpected.PolicyDigest,
+		WorkflowDigest:    identityExpected.WorkflowDigest,
+		EnvironmentDigest: identityExpected.EnvironmentDigest,
+	}
+	evidence, found, err := server.receiptStore.LookupEvidence(identity)
+	if err != nil {
+		return githubapp.Rejected(server.config.Mode, identityExpected, "malformed_receipt", err.Error(), evidence.ReceiptPath)
+	}
+	if !found {
+		return githubapp.Rejected(server.config.Mode, identityExpected, "proof_missing", "no proof matches the required identity", evidence.ReceiptPath)
+	}
+	if evidence.RunID == "" {
+		return githubapp.Rejected(server.config.Mode, identityExpected, "run_unbound", "proof is not bound to a server-issued run", evidence.ReceiptPath)
+	}
+
+	now := server.now()
+	record, found, err := server.grantStore.Lookup(evidence.RunID, now)
+	if err != nil {
+		return githubapp.Rejected(server.config.Mode, identityExpected, "run_state_invalid", err.Error(), evidence.ReceiptPath)
+	}
+	if !found {
+		return githubapp.Rejected(server.config.Mode, identityExpected, "run_unbound", "proof run binding does not exist", evidence.ReceiptPath)
+	}
+	if record.Status != rungrant.StatusSubmitted && record.Status != rungrant.StatusConsumed {
+		code := "run_unsubmitted"
+		if record.Status == rungrant.StatusExpired {
+			code = "expired"
+		}
+		return githubapp.Rejected(server.config.Mode, identityExpected, code, "proof run is not submitted and valid", evidence.ReceiptPath)
+	}
+	if record.ReceiptDigest != evidence.ReceiptDigest {
+		return githubapp.Rejected(server.config.Mode, identityExpected, "receipt_digest_mismatch", "proof digest does not match its submitted run", evidence.ReceiptPath)
+	}
+	if record.Grant.TreeSHA != identityExpected.TreeSHA {
+		return githubapp.Rejected(server.config.Mode, identityExpected, "tree_mismatch", "run grant tree does not match the current GitHub merge tree", evidence.ReceiptPath)
+	}
+	expected := expectedFromGrant(record.Grant, identityExpected.TreeSHA, now)
+	decision := githubapp.EvaluateEnvelope(evidence.Envelope, evidence.ReceiptPath, server.publicKey, expected, server.config.Mode)
+	if !decision.Accepted {
+		return decision
+	}
+	if _, err := server.grantStore.MarkConsumed(evidence.RunID, now); err != nil {
+		code := "run_state_invalid"
+		if errors.Is(err, rungrant.ErrGrantExpired) {
+			code = "expired"
+		} else if errors.Is(err, rungrant.ErrLifecycleConflict) {
+			code = "nonce_invalid"
+		}
+		return githubapp.Rejected(server.config.Mode, expected, code, err.Error(), evidence.ReceiptPath)
+	}
+	return decision
+}
+
+func expectedFromGrant(grant rungrant.Grant, treeSHA string, now time.Time) verifier.Expected {
+	return verifier.Expected{
+		Repository:        grant.Policy.Repository,
+		HeadSHA:           grant.HeadSHA,
+		BaseSHA:           grant.BaseSHA,
+		TreeSHA:           treeSHA,
+		Profile:           grant.Policy.Profile,
+		PolicyDigest:      grant.PolicyDigest,
+		WorkflowDigest:    grant.WorkflowDigest,
+		EnvironmentDigest: grant.EnvironmentDigest,
+		Architecture:      grant.Architecture,
+		Command:           append([]string(nil), grant.Policy.Command...),
+		RequiredJobs:      []string{grant.Policy.Profile},
+		Nonce:             grant.Nonce,
+		MaxAge:            grant.ExpiresAt.Sub(grant.IssuedAt),
+		NotBefore:         grant.IssuedAt,
+		ExpiresAt:         grant.ExpiresAt,
+		Now:               now,
+	}
 }
 
 func (server *Server) dispatchFallback(ctx context.Context, token string, payload pullRequestPayload, decision githubapp.Result, checkRunID int64) error {
@@ -313,6 +681,37 @@ func (server *Server) handleWorkflowRun(ctx context.Context, body []byte) error 
 	if payload.Action != "completed" || payload.WorkflowRun.ID <= 0 {
 		return nil
 	}
+	if server.config.Mode == githubapp.ShadowMode {
+		if server.config.ShadowWorkflow == "" || payload.WorkflowRun.Name != server.config.ShadowWorkflow {
+			return nil
+		}
+		if payload.Repository.FullName != server.config.Repository {
+			return nil
+		}
+		if payload.Installation.ID <= 0 {
+			return fmt.Errorf("workflow_run webhook is missing installation identity")
+		}
+		token, err := server.github.InstallationToken(ctx, payload.Installation.ID, server.config.Repository)
+		if err != nil {
+			return err
+		}
+		job, err := server.github.GetWorkflowJob(ctx, token, server.config.Repository, payload.WorkflowRun.ID, server.config.ShadowJob)
+		if err != nil {
+			return err
+		}
+		_, _, err = server.shadowStore.RecordWorkflow(server.config.Repository, shadow.Workflow{
+			Name:        job.Name,
+			RunID:       payload.WorkflowRun.ID,
+			HeadSHA:     payload.WorkflowRun.HeadSHA,
+			Conclusion:  job.Conclusion,
+			StartedAt:   job.StartedAt,
+			CompletedAt: job.CompletedAt,
+		})
+		if err != nil {
+			return fmt.Errorf("record shadow workflow: %w", err)
+		}
+		return nil
+	}
 	state, found, err := server.stateStore.LookupWorkflowRun(payload.WorkflowRun.ID)
 	if err != nil {
 		return err
@@ -367,10 +766,13 @@ func fallbackConclusion(payload workflowRunPayload, state FallbackState, now tim
 		return "failure", "CIHash fallback failed", fmt.Sprintf("Trusted fallback workflow run %d concluded with %q.", payload.WorkflowRun.ID, payload.WorkflowRun.Conclusion)
 	}
 }
+func comparableProofDecision(decision githubapp.Result) bool {
+	return decision.Accepted || decision.Code == "job_failed" || decision.Code == "proof_failed"
+}
 
 func supportedPullRequestAction(action string) bool {
 	switch action {
-	case "opened", "reopened", "synchronize", "ready_for_review":
+	case "opened", "reopened", "synchronize", "ready_for_review", "edited":
 		return true
 	default:
 		return false

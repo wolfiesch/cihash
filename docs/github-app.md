@@ -33,6 +33,9 @@ The App private key, webhook secret, and receipt-signing key are separate creden
   "receiptStore": "./var/receipts",
   "stateDirectory": "./var/state",
   "mode": "shadow",
+  "shadowWorkflow": "CI",
+  "shadowJob": "tooling",
+  "buildMode": "production",
   "fallbackWorkflow": "cihash-fallback.yml",
   "detailsUrl": "https://cihash.example/checks",
   "githubApiBaseUrl": "https://api.github.com"
@@ -47,6 +50,7 @@ Supply credentials through the service environment:
 CIHASH_GITHUB_CLIENT_ID
 CIHASH_GITHUB_PRIVATE_KEY_PATH
 CIHASH_GITHUB_WEBHOOK_SECRET
+CIHASH_PRODUCER_TOKEN
 ```
 
 GitHub recommends the App client ID as the JWT `iss` claim. CIHash signs RS256 JWTs with `iat` 60 seconds in the past and `exp` nine minutes in the future, then exchanges them for one-hour installation tokens scoped to the configured repository and the `checks:write` and `actions:write` permissions.
@@ -67,37 +71,50 @@ Expose only the configured webhook path through the deployment proxy. GitHub sen
 
 ## Run grant boundary
 
-The v0.1 control-plane protocol issues one persisted run grant for one exact
-head/base pair and the configured administrator-owned policy. The returned
-grant includes the approved command and immutable environment identity so the
-producer does not read verification authority from the submitted tree. A
-distinct server nonce binds the resulting receipt to the grant.
+The v0.1 control-plane protocol exposes authenticated endpoints for one
+server-authorized run:
+
+- `POST /api/v1/runs` accepts an installation ID and pull-request number,
+  resolves the current same-repository head, base, and GitHub merge-tree identity,
+  persists a grant, and returns it;
+- `POST /api/v1/runs/{run-id}/receipt` verifies the signed receipt and uploaded
+  log against that exact grant before binding and storing the evidence.
+
+The grant includes the approved command and structured immutable execution
+environment, so the producer does not read verification authority from the
+submitted tree. A distinct server nonce binds the resulting receipt to the
+grant. The run ID and nonce remain proof bindings rather than credentials; both
+endpoints require the separately configured producer bearer token.
 
 Grant state moves only from `issued` to `submitted` to `consumed`. Initial
 submission and consumption must both occur before expiry. Expired grants,
 replacement receipt digests, and out-of-order transitions fail closed.
-Repeating the same verified receipt submission or consumption is idempotent
-only while the grant remains valid.
-
-The run ID and nonce do not authenticate a producer. The authenticated issuance
-and receipt-submission HTTP endpoints are separate hosted-service work; until
-those endpoints are enabled, the grant contract and lifecycle are internal and
-do not expose a network authorization surface.
+Repeating the same verified receipt submission or consumption is idempotent only
+while the grant remains valid.
 
 ## Pull-request decision flow
 
 For `opened`, `reopened`, `synchronize`, and `ready_for_review` events:
 
-1. read the current PR from GitHub instead of trusting revision fields in the webhook body;
+1. read the current PR and merge-commit tree from GitHub instead of trusting revision fields in the webhook body;
 2. reject fork PRs, which are outside the v0.1 trust boundary;
 3. derive the expected proof identity from the exact current head and base SHAs plus the approved server-side policy;
-4. evaluate the local receipt store using the trusted receipt public key;
-5. create an App-owned `cihash/verify` check on the PR head;
-6. finish immediately when the exact proof is accepted;
+4. load only evidence bound to an immutable server-issued run and matching submitted receipt digest;
+5. verify the receipt against the grant's nonce, timing, architecture, policy, and the current GitHub merge tree;
+6. atomically consume the valid run before publishing an App-owned `cihash/verify` success check;
 7. publish `neutral` in shadow mode when proof reuse is rejected;
 8. create a queued check and dispatch the trusted fallback workflow in enforcement mode.
 
 Webhook delivery IDs are persisted. Completed or concurrent duplicate deliveries do not create another check.
+
+In shadow mode, `shadowWorkflow` and `shadowJob` select the ordinary Actions
+job used for parity evidence. A completed matching workflow event causes CIHash
+to fetch that exact job through the installation-scoped GitHub API. It records
+the proof decision, rejection code, ordinary job conclusion, proof verification
+latency, App decision latency, ordinary job duration, service source revision,
+service binary digest, build mode, policy timeout, and observation timestamps in
+the administrator-owned state directory. Aggregate workflow conclusions are not
+used as a substitute for the selected job.
 
 ## Trusted fallback contract
 

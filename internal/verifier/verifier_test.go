@@ -52,6 +52,23 @@ func TestVerifyRejectsChangedBase(t *testing.T) {
 		t.Fatalf("decision = %+v, want base_mismatch", decision)
 	}
 }
+func TestVerifyRejectsChangedTree(t *testing.T) {
+	envelope, publicKey, expected := signedFixture(t, "success")
+	expected.TreeSHA = strings.Repeat("d", 40)
+	decision := Verify(envelope, publicKey, expected)
+	if decision.Accepted || decision.Code != "tree_mismatch" {
+		t.Fatalf("decision = %+v, want tree_mismatch", decision)
+	}
+}
+
+func TestVerifyRejectsChangedArchitecture(t *testing.T) {
+	envelope, publicKey, expected := signedFixture(t, "success")
+	expected.Architecture = "linux/amd64"
+	decision := Verify(envelope, publicKey, expected)
+	if decision.Accepted || decision.Code != "architecture_mismatch" {
+		t.Fatalf("decision = %+v, want architecture_mismatch", decision)
+	}
+}
 
 func TestVerifyRejectsSignedFailure(t *testing.T) {
 	envelope, publicKey, expected := signedFixture(t, "failure")
@@ -115,10 +132,12 @@ func signedFixture(t *testing.T, conclusion string) (attestation.Envelope, ed255
 		Repository:        result.Repository,
 		HeadSHA:           result.HeadSHA,
 		BaseSHA:           result.BaseSHA,
+		TreeSHA:           result.TreeSHA,
 		Profile:           result.Profile,
 		PolicyDigest:      result.PolicyDigest,
 		WorkflowDigest:    result.WorkflowDigest,
 		EnvironmentDigest: result.EnvironmentDigest,
+		Architecture:      result.Architecture,
 		Command:           command,
 		RequiredJobs:      []string{"verify"},
 		Nonce:             result.Nonce,

@@ -14,11 +14,12 @@ import (
 	"hash"
 	"io"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/wolfiesch/cihash/internal/gitexec"
 )
 
 const (
@@ -73,7 +74,7 @@ func Materialize(ctx context.Context, options Options) (result Result, err error
 	if git == "" {
 		git = "git"
 	}
-	objectType, commandErr := exec.CommandContext(ctx, git, "-C", repository, "cat-file", "-t", options.TreeSHA).CombinedOutput()
+	objectType, commandErr := gitexec.Command(ctx, git, repository, "cat-file", "-t", options.TreeSHA).CombinedOutput()
 	if commandErr != nil {
 		return Result{}, fmt.Errorf("inspect Git object: %w: %s", commandErr, strings.TrimSpace(string(objectType)))
 	}
@@ -109,7 +110,7 @@ func Materialize(ctx context.Context, options Options) (result Result, err error
 		}
 	}()
 
-	archive := exec.CommandContext(ctx, git, "-C", repository, "archive", "--format=tar", options.TreeSHA)
+	archive := gitexec.Command(ctx, git, repository, "archive", "--format=tar", options.TreeSHA)
 	var stderr bytes.Buffer
 	archive.Stderr = &stderr
 	stdout, err := archive.StdoutPipe()
@@ -145,7 +146,7 @@ type manifestEntry struct {
 }
 
 func readTreeManifest(ctx context.Context, git, repository, treeSHA string, maxEntries int, maxBytes int64) (map[string]manifestEntry, error) {
-	command := exec.CommandContext(ctx, git, "-C", repository, "ls-tree", "-r", "-l", "-z", "--full-tree", treeSHA)
+	command := gitexec.Command(ctx, git, repository, "ls-tree", "-r", "-l", "-z", "--full-tree", treeSHA)
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
 	stdout, err := command.StdoutPipe()

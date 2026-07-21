@@ -38,8 +38,10 @@ func TestInstallationTokenUsesValidAppJWTAndScopedPermissions(t *testing.T) {
 			t.Fatal(err)
 		}
 		if len(body.Repositories) != 1 || body.Repositories[0] != "project" ||
+			len(body.Permissions) != 4 ||
 			body.Permissions["actions"] != "write" ||
 			body.Permissions["checks"] != "write" ||
+			body.Permissions["contents"] != "read" ||
 			body.Permissions["pull_requests"] != "read" {
 			t.Fatalf("installation scope = %+v", body)
 		}
@@ -63,8 +65,7 @@ func TestInstallationTokenUsesValidAppJWTAndScopedPermissions(t *testing.T) {
 
 func TestCheckAndWorkflowRequestsUseInstallationToken(t *testing.T) {
 	privateKey := generateRSAKey(t)
-	var createSeen, updateSeen, dispatchSeen bool
-	var pullSeen bool
+	var createSeen, updateSeen, dispatchSeen, pullSeen, mergeCommitSeen, jobSeen bool
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.Header.Get("Authorization") != "Bearer installation-token" {
 			t.Fatalf("authorization = %q", request.Header.Get("Authorization"))
@@ -73,7 +74,11 @@ func TestCheckAndWorkflowRequestsUseInstallationToken(t *testing.T) {
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/project/pulls/7":
 			pullSeen = true
 			response.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(response, `{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repo":{"full_name":"owner/project"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main"}}`)
+			_, _ = io.WriteString(response, `{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repo":{"full_name":"owner/project"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main"},"merge_commit_sha":"cccccccccccccccccccccccccccccccccccccccc"}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/project/git/commits/cccccccccccccccccccccccccccccccccccccccc":
+			mergeCommitSeen = true
+			response.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(response, `{"tree":{"sha":"dddddddddddddddddddddddddddddddddddddddd"}}`)
 		case request.Method == http.MethodPost && request.URL.Path == "/repos/owner/project/check-runs":
 			createSeen = true
 			response.WriteHeader(http.StatusCreated)
@@ -93,6 +98,13 @@ func TestCheckAndWorkflowRequestsUseInstallationToken(t *testing.T) {
 			}
 			response.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(response, `{"workflow_run_id":99}`)
+		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/project/actions/runs/99/jobs":
+			jobSeen = true
+			if request.URL.Query().Get("filter") != "latest" || request.URL.Query().Get("per_page") != "100" {
+				t.Fatalf("workflow jobs query = %q", request.URL.RawQuery)
+			}
+			response.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(response, `{"jobs":[{"id":101,"name":"tooling","status":"completed","conclusion":"success","started_at":"2026-07-20T12:00:00Z","completed_at":"2026-07-20T12:01:00Z"}]}`)
 		default:
 			http.Error(response, "unexpected request", http.StatusNotFound)
 		}
@@ -107,7 +119,8 @@ func TestCheckAndWorkflowRequestsUseInstallationToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	if pullRequest.HeadSHA != strings.Repeat("a", 40) || pullRequest.BaseSHA != strings.Repeat("b", 40) ||
-		pullRequest.HeadRepository != "owner/project" || pullRequest.BaseRef != "main" {
+		pullRequest.HeadRepository != "owner/project" || pullRequest.BaseRef != "main" ||
+		pullRequest.TreeSHA != strings.Repeat("d", 40) {
 		t.Fatalf("GetPullRequest = %+v", pullRequest)
 	}
 	checkID, err := client.CreateCheckRun(context.Background(), "installation-token", "owner/project", githubapp.CheckRunRequest{
@@ -135,8 +148,94 @@ func TestCheckAndWorkflowRequestsUseInstallationToken(t *testing.T) {
 	if err != nil || runID != 99 {
 		t.Fatalf("DispatchWorkflow = %d, %v", runID, err)
 	}
-	if !pullSeen || !createSeen || !updateSeen || !dispatchSeen {
-		t.Fatalf("requests seen: pull=%v create=%v update=%v dispatch=%v", pullSeen, createSeen, updateSeen, dispatchSeen)
+	job, err := client.GetWorkflowJob(context.Background(), "installation-token", "owner/project", runID, "tooling")
+	if err != nil || job.ID != 101 || job.Conclusion != "success" || job.CompletedAt.Sub(job.StartedAt) != time.Minute {
+		t.Fatalf("GetWorkflowJob = %+v, %v", job, err)
+	}
+	if !pullSeen || !mergeCommitSeen || !createSeen || !updateSeen || !dispatchSeen || !jobSeen {
+		t.Fatalf("requests seen: pull=%v mergeCommit=%v create=%v update=%v dispatch=%v job=%v", pullSeen, mergeCommitSeen, createSeen, updateSeen, dispatchSeen, jobSeen)
+	}
+}
+
+func TestGetPullRequestFailsClosedWithoutAuthoritativeMergeTree(t *testing.T) {
+	const (
+		headSHA        = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		baseSHA        = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		mergeCommitSHA = "cccccccccccccccccccccccccccccccccccccccc"
+	)
+	tests := []struct {
+		name       string
+		pullBody   string
+		commitBody string
+		commitCode int
+		wantError  string
+	}{
+		{
+			name:      "missing merge commit",
+			pullBody:  `{"head":{"sha":"` + headSHA + `","repo":{"full_name":"owner/project"}},"base":{"sha":"` + baseSHA + `","ref":"main"}}`,
+			wantError: "GitHub has no merge commit",
+		},
+		{
+			name:      "malformed pull request identity",
+			pullBody:  `{"head":{"sha":"not-a-git-object","repo":{"full_name":"owner/project"}},"base":{"sha":"` + baseSHA + `","ref":"main"},"merge_commit_sha":"` + mergeCommitSHA + `"}`,
+			wantError: "GitHub returned malformed pull request identity",
+		},
+		{
+			name:      "malformed merge commit",
+			pullBody:  `{"head":{"sha":"` + headSHA + `","repo":{"full_name":"owner/project"}},"base":{"sha":"` + baseSHA + `","ref":"main"},"merge_commit_sha":"not-a-git-object"}`,
+			wantError: "GitHub returned malformed pull request merge commit SHA",
+		},
+		{
+			name:       "merge commit unavailable",
+			pullBody:   `{"head":{"sha":"` + headSHA + `","repo":{"full_name":"owner/project"}},"base":{"sha":"` + baseSHA + `","ref":"main"},"merge_commit_sha":"` + mergeCommitSHA + `"}`,
+			commitCode: http.StatusServiceUnavailable,
+			wantError:  "fetch GitHub pull request merge commit",
+		},
+		{
+			name:       "missing merge tree",
+			pullBody:   `{"head":{"sha":"` + headSHA + `","repo":{"full_name":"owner/project"}},"base":{"sha":"` + baseSHA + `","ref":"main"},"merge_commit_sha":"` + mergeCommitSHA + `"}`,
+			commitBody: `{"tree":{}}`,
+			wantError:  "GitHub returned no tree SHA",
+		},
+		{
+			name:       "malformed merge tree",
+			pullBody:   `{"head":{"sha":"` + headSHA + `","repo":{"full_name":"owner/project"}},"base":{"sha":"` + baseSHA + `","ref":"main"},"merge_commit_sha":"` + mergeCommitSHA + `"}`,
+			commitBody: `{"tree":{"sha":"not-a-git-object"}}`,
+			wantError:  "GitHub returned malformed pull request merge tree SHA",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			commitRequested := false
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				switch request.URL.Path {
+				case "/repos/owner/project/pulls/7":
+					response.WriteHeader(http.StatusOK)
+					_, _ = io.WriteString(response, test.pullBody)
+				case "/repos/owner/project/git/commits/" + mergeCommitSHA:
+					commitRequested = true
+					if test.commitCode != 0 {
+						http.Error(response, "unavailable", test.commitCode)
+						return
+					}
+					response.WriteHeader(http.StatusOK)
+					_, _ = io.WriteString(response, test.commitBody)
+				default:
+					http.Error(response, "unexpected request", http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			client, err := New(server.URL, "client-id", generateRSAKey(t), server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.GetPullRequest(context.Background(), "installation-token", "owner/project", 7); err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("GetPullRequest error = %v, want %q", err, test.wantError)
+			}
+			if (test.commitBody != "" || test.commitCode != 0) != commitRequested {
+				t.Fatalf("merge commit requested = %v", commitRequested)
+			}
+		})
 	}
 }
 

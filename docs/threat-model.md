@@ -32,6 +32,7 @@ A signature proves who made a claim. Isolation and policy determine whether that
 | Receipt replayed for different code | Bind repository, head, base, merge tree, policy, workflow, environment, nonce, and expiry into the signed predicate. |
 | Repository weakens its own test command | Store or approve policy outside the submitted tree; bind the approved policy digest. |
 | Base changes after verification | Bind the exact base SHA and reject when the pull request base differs. |
+| Repository-local Git replacement metadata changes resolved objects | Disable Git replacement and process-level object/config overrides for every trusted Git command, then compare the signed tree to the merge-commit tree independently resolved through GitHub. |
 | Required matrix job omitted | Bind the complete approved job set and require every job to succeed. |
 | Mutable dependency or fixture changes | Pin or digest every accepted input; otherwise reject reuse and run fallback CI. |
 | Another actor spoofs the status name | Require the check from the CIHash GitHub App as its source. |
@@ -46,13 +47,18 @@ A signature proves who made a claim. Isolation and policy determine whether that
 
 ## Development runner limitation
 
-The initial local runner executes a clean committed tree as a child process, but
-its checkout still includes Git metadata. The separate `tree-isolation` lab can
-materialize and verify a metadata-free tree; it is not yet the runner's source
-path. Neither mechanism is a production trust boundary: the workload shares the
-host user and kernel with the supervisor. Production enforcement requires an
-ephemeral VM or hardened container whose workload cannot inspect the supervisor
-or signing service.
+The trusted runner independently resolves the granted head and base, computes
+their merge tree, and materializes only that exact tree without `.git`, refs,
+hooks, remotes, or untracked host files. It runs the administrator-approved
+command in the policy-pinned Linux container with no network, a read-only root,
+dropped capabilities, no Docker socket, bounded resources, and only the
+metadata-free tree mounted read-only. The signing key is loaded only after the
+workload exits.
+
+This development arrangement still shares the host kernel and Docker daemon
+with the supervisor. Production enforcement requires an ephemeral VM or
+hardened container host with the signing service outside the workload host
+boundary.
 
 ## Unsupported trust claims
 

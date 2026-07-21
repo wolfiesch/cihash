@@ -14,6 +14,7 @@ func TestDockerArgumentsConstrainWorkload(t *testing.T) {
 	image := "sha256:" + strings.Repeat("a", 64)
 	arguments, cidFile, err := dockerArguments(Options{
 		Image:     image,
+		Platform:  "linux/amd64",
 		Network:   "none",
 		Memory:    "8g",
 		CPUs:      "6",
@@ -31,6 +32,7 @@ func TestDockerArgumentsConstrainWorkload(t *testing.T) {
 		"--cap-drop=ALL",
 		"--security-opt=no-new-privileges:true",
 		"--pids-limit=512",
+		"--platform=linux/amd64",
 		"--memory=8g",
 		"--cpus=6",
 		"--network=none",
@@ -99,5 +101,10 @@ func TestDockerArgumentsRejectMutableImageAndUnknownNetwork(t *testing.T) {
 	base.PIDsLimit = -1
 	if _, _, err := dockerArguments(base); err == nil || !strings.Contains(err.Error(), "PID limit must be positive") {
 		t.Fatalf("negative PID limit error = %v, want positive-limit rejection", err)
+	}
+	base.PIDsLimit = 1
+	base.Platform = "darwin/arm64"
+	if _, _, err := dockerArguments(base); err == nil || !strings.Contains(err.Error(), "container platform") {
+		t.Fatalf("invalid platform error = %v, want platform rejection", err)
 	}
 }

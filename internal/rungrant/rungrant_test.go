@@ -18,7 +18,7 @@ func TestIssueBindsAdministratorPolicyAndServerNonce(t *testing.T) {
 	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
 	configured := testPolicy()
 	entropy := bytes.NewReader(append(bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 32)...))
-	grant, err := issue(configured, strings.Repeat("a", 40), strings.Repeat("b", 40), "linux/amd64", now, entropy)
+	grant, err := issue(configured, strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("c", 40), now, entropy)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,6 +32,12 @@ func TestIssueBindsAdministratorPolicyAndServerNonce(t *testing.T) {
 		t.Fatalf("expiresAt = %v, want %v", got, want)
 	}
 
+	tamperedArchitecture := grant
+	tamperedArchitecture.Architecture = "linux/arm64"
+	if err := tamperedArchitecture.Validate(); !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("tampered architecture error = %v, want ErrInvalidGrant", err)
+	}
+
 	grant.Policy.Command[0] = "unapproved"
 	if err := grant.Validate(); !errors.Is(err, ErrInvalidGrant) {
 		t.Fatalf("tampered policy error = %v, want ErrInvalidGrant", err)
@@ -41,7 +47,7 @@ func TestIssueBindsAdministratorPolicyAndServerNonce(t *testing.T) {
 func TestGrantRejectsEqualIDAndNonce(t *testing.T) {
 	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
 	entropy := bytes.NewReader(bytes.Repeat([]byte{1}, 64))
-	if _, err := issue(testPolicy(), strings.Repeat("a", 40), strings.Repeat("b", 40), "linux/amd64", now, entropy); !errors.Is(err, ErrInvalidGrant) {
+	if _, err := issue(testPolicy(), strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("c", 40), now, entropy); !errors.Is(err, ErrInvalidGrant) {
 		t.Fatalf("equal ID and nonce error = %v, want ErrInvalidGrant", err)
 	}
 }
@@ -49,18 +55,19 @@ func TestGrantRejectsEqualIDAndNonce(t *testing.T) {
 func TestIssueRejectsInvalidExecutionIdentity(t *testing.T) {
 	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
 	for _, test := range []struct {
-		name         string
-		head         string
-		base         string
-		architecture string
+		name string
+		head string
+		base string
+		tree string
 	}{
-		{name: "short head", head: "abc", base: strings.Repeat("b", 40), architecture: "linux/amd64"},
-		{name: "mixed object formats", head: strings.Repeat("a", 40), base: strings.Repeat("b", 64), architecture: "linux/amd64"},
-		{name: "non Linux architecture", head: strings.Repeat("a", 40), base: strings.Repeat("b", 40), architecture: "darwin/arm64"},
+		{name: "short head", head: "abc", base: strings.Repeat("b", 40), tree: strings.Repeat("c", 40)},
+		{name: "mixed object formats", head: strings.Repeat("a", 40), base: strings.Repeat("b", 64), tree: strings.Repeat("c", 40)},
+		{name: "mixed tree format", head: strings.Repeat("a", 40), base: strings.Repeat("b", 40), tree: strings.Repeat("c", 64)},
+		{name: "missing tree", head: strings.Repeat("a", 40), base: strings.Repeat("b", 40)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			entropy := bytes.NewReader(bytes.Repeat([]byte{1}, 64))
-			if _, err := issue(testPolicy(), test.head, test.base, test.architecture, now, entropy); !errors.Is(err, ErrInvalidGrant) {
+			if _, err := issue(testPolicy(), test.head, test.base, test.tree, now, entropy); !errors.Is(err, ErrInvalidGrant) {
 				t.Fatalf("issue error = %v, want ErrInvalidGrant", err)
 			}
 		})
@@ -185,7 +192,7 @@ func TestStoreRejectsTamperedStateAndConcurrentMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	record.Grant.Policy.Environment = "unapproved"
+	record.Grant.Policy.Environment.Image = "unapproved"
 	if err := writeAtomic(store.recordPath(grant.ID), record); err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +209,7 @@ func testGrant(t *testing.T, now time.Time) Grant {
 func testGrantWithEntropy(t *testing.T, now time.Time, value byte) Grant {
 	t.Helper()
 	entropy := bytes.NewReader(append(bytes.Repeat([]byte{value}, 32), bytes.Repeat([]byte{value + 1}, 32)...))
-	grant, err := issue(testPolicy(), strings.Repeat("a", 40), strings.Repeat("b", 40), "linux/amd64", now, entropy)
+	grant, err := issue(testPolicy(), strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("c", 40), now, entropy)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,11 +218,19 @@ func testGrantWithEntropy(t *testing.T, now time.Time, value byte) Grant {
 
 func testPolicy() policy.Policy {
 	return policy.Policy{
-		Version:        policy.Version,
-		Repository:     "github.com/acme/project",
-		Profile:        "verify",
-		Command:        []string{"go", "test", "./..."},
-		Environment:    "oci://registry.example/ci@sha256:" + strings.Repeat("c", 64),
+		Version:    policy.Version,
+		Repository: "github.com/acme/project",
+		Profile:    "verify",
+		Command:    []string{"go", "test", "./..."},
+		Environment: policy.Environment{
+			Image:          "sha256:" + strings.Repeat("c", 64),
+			Platform:       "linux/amd64",
+			Network:        "none",
+			Memory:         "8g",
+			CPUs:           "6",
+			PIDsLimit:      1024,
+			MaxOutputBytes: 16 << 20,
+		},
 		MaxAgeSeconds:  3600,
 		TimeoutSeconds: 300,
 	}

@@ -24,6 +24,9 @@ type Config struct {
 	StateDirectory       string         `json:"stateDirectory"`
 	Mode                 githubapp.Mode `json:"mode"`
 	FallbackWorkflow     string         `json:"fallbackWorkflow,omitempty"`
+	ShadowWorkflow       string         `json:"shadowWorkflow,omitempty"`
+	ShadowJob            string         `json:"shadowJob,omitempty"`
+	BuildMode            string         `json:"buildMode,omitempty"`
 	GitHubAPIBaseURL     string         `json:"githubApiBaseUrl,omitempty"`
 	DetailsURL           string         `json:"detailsUrl,omitempty"`
 }
@@ -66,6 +69,9 @@ func (configured *Config) applyDefaults() {
 	if configured.Mode == "" {
 		configured.Mode = githubapp.ShadowMode
 	}
+	if configured.BuildMode == "" {
+		configured.BuildMode = "development"
+	}
 }
 
 func (configured *Config) resolvePaths(base string) {
@@ -83,14 +89,29 @@ func (configured Config) Validate() error {
 	if strings.TrimSpace(configured.CheckName) != configured.CheckName || !strings.HasPrefix(configured.CheckName, "cihash/") || len(configured.CheckName) > 100 {
 		return fmt.Errorf("checkName must start with cihash/, contain no surrounding whitespace, and be at most 100 characters")
 	}
-	if !validWebhookPath(configured.WebhookPath) {
-		return fmt.Errorf("webhookPath must be a clean literal path distinct from /health")
+	if !validWebhookPath(configured.WebhookPath) || configured.WebhookPath == runsEndpoint || strings.HasPrefix(configured.WebhookPath, runsEndpoint+"/") {
+		return fmt.Errorf("webhookPath must be a clean literal path distinct from protected endpoints")
 	}
 	if configured.PolicyFile == "" || configured.ReceiptPublicKeyFile == "" || configured.ReceiptStore == "" || configured.StateDirectory == "" {
 		return fmt.Errorf("policyFile, receiptPublicKeyFile, receiptStore, and stateDirectory are required")
 	}
+	if filepath.Clean(configured.ReceiptStore) == filepath.Clean(configured.StateDirectory) {
+		return fmt.Errorf("receiptStore and stateDirectory must be distinct")
+	}
 	if configured.Mode != githubapp.ShadowMode && configured.Mode != githubapp.EnforceMode {
 		return fmt.Errorf("hosted mode must be shadow or enforce")
+	}
+	if strings.TrimSpace(configured.BuildMode) != configured.BuildMode {
+		return fmt.Errorf("buildMode must not contain surrounding whitespace")
+	}
+	if strings.TrimSpace(configured.ShadowWorkflow) != configured.ShadowWorkflow {
+		return fmt.Errorf("shadowWorkflow must not contain surrounding whitespace")
+	}
+	if strings.TrimSpace(configured.ShadowJob) != configured.ShadowJob {
+		return fmt.Errorf("shadowJob must not contain surrounding whitespace")
+	}
+	if (configured.ShadowWorkflow == "") != (configured.ShadowJob == "") {
+		return fmt.Errorf("shadowWorkflow and shadowJob must be configured together")
 	}
 	if configured.Mode == githubapp.EnforceMode {
 		if configured.FallbackWorkflow == "" {

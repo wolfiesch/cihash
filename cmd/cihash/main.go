@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -25,7 +23,10 @@ import (
 	"github.com/wolfiesch/cihash/internal/hosted"
 	"github.com/wolfiesch/cihash/internal/lab"
 	"github.com/wolfiesch/cihash/internal/policy"
+	"github.com/wolfiesch/cihash/internal/producer"
+	"github.com/wolfiesch/cihash/internal/rungrant"
 	"github.com/wolfiesch/cihash/internal/runner"
+	"github.com/wolfiesch/cihash/internal/shadow"
 	"github.com/wolfiesch/cihash/internal/store"
 	"github.com/wolfiesch/cihash/internal/verifier"
 )
@@ -56,6 +57,8 @@ func execute(arguments []string, output io.Writer) *commandError {
 		return policyCommand(arguments[1:], output)
 	case "run":
 		return runCommand(arguments[1:], output)
+	case "hosted-run":
+		return hostedRunCommand(arguments[1:], output)
 	case "container-exec":
 		return containerExecCommand(arguments[1:], output)
 	case "verify":
@@ -134,12 +137,13 @@ func policyCommand(arguments []string, output io.Writer) *commandError {
 func runCommand(arguments []string, output io.Writer) *commandError {
 	flags := flag.NewFlagSet("run", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	repositoryPath := flags.String("repo", ".", "path to the clean Git repository")
+	repositoryPath := flags.String("repo", ".", "path to the Git repository")
 	head := flags.String("head", "HEAD", "head revision to verify")
-	base := flags.String("base", "", "base revision to merge into the head")
+	base := flags.String("base", "", "base revision to merge with the head")
 	policyPath := flags.String("policy", "", "approved policy file")
 	privateKeyPath := flags.String("private-key", "", "Ed25519 private key")
 	storePath := flags.String("store", defaultStorePath(), "receipt store path")
+	docker := flags.String("docker", "docker", "Docker-compatible CLI")
 	if err := flags.Parse(arguments); err != nil {
 		return usageError(err)
 	}
@@ -150,21 +154,29 @@ func runCommand(arguments []string, output io.Writer) *commandError {
 	if err != nil {
 		return operationalError(err)
 	}
-	privateKey, err := attestation.LoadPrivateKey(*privateKeyPath)
+	runContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	headSHA, baseSHA, err := runner.ResolveRevisions(runContext, *repositoryPath, *head, *base)
 	if err != nil {
 		return operationalError(err)
 	}
-	nonce, err := newNonce()
+	treeSHA, err := runner.ResolveMergeTree(runContext, *repositoryPath, baseSHA, headSHA)
 	if err != nil {
 		return operationalError(err)
 	}
-	outcome, err := runner.Run(context.Background(), runner.Request{
+	grant, err := rungrant.Issue(configured, headSHA, baseSHA, treeSHA, time.Now().UTC())
+	if err != nil {
+		return operationalError(err)
+	}
+	outcome, err := runner.Run(runContext, runner.Request{
 		RepositoryPath: *repositoryPath,
-		HeadRevision:   *head,
-		BaseRevision:   *base,
-		Policy:         configured,
-		Nonce:          nonce,
+		Grant:          grant,
+		Container:      runner.ContainerConfig{DockerBinary: *docker},
 	})
+	if err != nil {
+		return operationalError(err)
+	}
+	privateKey, err := attestation.LoadPrivateKey(*privateKeyPath)
 	if err != nil {
 		return operationalError(err)
 	}
@@ -178,6 +190,7 @@ func runCommand(arguments []string, output io.Writer) *commandError {
 		return operationalError(err)
 	}
 	summary := map[string]any{
+		"runId":       grant.ID,
 		"conclusion":  outcome.Result.Conclusion,
 		"headSha":     outcome.Result.HeadSHA,
 		"baseSha":     outcome.Result.BaseSHA,
@@ -195,6 +208,73 @@ func runCommand(arguments []string, output io.Writer) *commandError {
 	return nil
 }
 
+func hostedRunCommand(arguments []string, output io.Writer) *commandError {
+	flags := flag.NewFlagSet("hosted-run", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	serverURL := flags.String("server", "", "CIHash control-plane base URL")
+	tokenPath := flags.String("token-file", "", "producer bearer token file")
+	installationID := flags.Int64("installation", 0, "GitHub App installation ID")
+	pullRequestNumber := flags.Int64("pull-request", 0, "pull request number")
+	repositoryPath := flags.String("repo", ".", "path to the Git repository")
+	privateKeyPath := flags.String("private-key", "", "Ed25519 private key")
+	docker := flags.String("docker", "docker", "Docker-compatible CLI")
+	if err := flags.Parse(arguments); err != nil {
+		return usageError(err)
+	}
+	if *serverURL == "" || *tokenPath == "" || *installationID <= 0 || *pullRequestNumber <= 0 || *privateKeyPath == "" {
+		return usageError(errors.New("--server, --token-file, --installation, --pull-request, and --private-key are required"))
+	}
+	token, err := os.ReadFile(*tokenPath)
+	if err != nil {
+		return operationalError(fmt.Errorf("read producer token: %w", err))
+	}
+	client, err := producer.New(*serverURL, token, &http.Client{Timeout: 30 * time.Second})
+	if err != nil {
+		return operationalError(err)
+	}
+	privateKey, err := attestation.LoadPrivateKey(*privateKeyPath)
+	if err != nil {
+		return operationalError(err)
+	}
+	runContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	grant, err := client.Issue(runContext, *installationID, *pullRequestNumber)
+	if err != nil {
+		return operationalError(err)
+	}
+	outcome, err := runner.Run(runContext, runner.Request{
+		RepositoryPath: *repositoryPath,
+		Grant:          grant,
+		Container:      runner.ContainerConfig{DockerBinary: *docker},
+	})
+	if err != nil {
+		return operationalError(err)
+	}
+	envelope, err := attestation.Sign(attestation.NewStatement(outcome.Result), privateKey)
+	if err != nil {
+		return operationalError(err)
+	}
+	receiptDigest, err := client.Submit(runContext, grant.ID, envelope, outcome.Log)
+	if err != nil {
+		return operationalError(err)
+	}
+	summary := map[string]any{
+		"runId":         grant.ID,
+		"conclusion":    outcome.Result.Conclusion,
+		"headSha":       outcome.Result.HeadSHA,
+		"baseSha":       outcome.Result.BaseSHA,
+		"treeSha":       outcome.Result.TreeSHA,
+		"receiptDigest": receiptDigest,
+	}
+	if writeErr := writeJSON(output, summary); writeErr != nil {
+		return writeErr
+	}
+	if outcome.Result.Conclusion != "success" {
+		return &commandError{code: 1, err: errors.New("verification command failed; signed failure receipt submitted")}
+	}
+	return nil
+}
+
 func verifyCommand(arguments []string, output io.Writer) *commandError {
 	flags := flag.NewFlagSet("verify", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -203,12 +283,13 @@ func verifyCommand(arguments []string, output io.Writer) *commandError {
 	publicKeyPath := flags.String("public-key", "", "trusted Ed25519 public key")
 	head := flags.String("head", "", "expected head commit SHA")
 	base := flags.String("base", "", "expected base commit SHA")
+	tree := flags.String("tree", "", "expected GitHub merge-tree SHA")
 	nonce := flags.String("nonce", "", "expected job nonce")
 	if err := flags.Parse(arguments); err != nil {
 		return usageError(err)
 	}
-	if *receiptPath == "" || *policyPath == "" || *publicKeyPath == "" || *head == "" || *base == "" {
-		return usageError(errors.New("--receipt, --policy, --public-key, --head, and --base are required"))
+	if *receiptPath == "" || *policyPath == "" || *publicKeyPath == "" || *head == "" || *base == "" || *tree == "" || *nonce == "" {
+		return usageError(errors.New("--receipt, --policy, --public-key, --head, --base, --tree, and --nonce are required"))
 	}
 	configured, _, err := policy.Load(*policyPath)
 	if err != nil {
@@ -230,6 +311,7 @@ func verifyCommand(arguments []string, output io.Writer) *commandError {
 	if err != nil {
 		return operationalError(err)
 	}
+	expected.TreeSHA = *tree
 	decision := verifier.Verify(envelope, publicKey, expected)
 	if err := writeJSON(output, decision); err != nil {
 		return err
@@ -248,13 +330,14 @@ func checkCommand(arguments []string, output io.Writer) *commandError {
 	storePath := flags.String("store", defaultStorePath(), "receipt store path")
 	head := flags.String("head", "", "expected head commit SHA")
 	base := flags.String("base", "", "expected base commit SHA")
+	tree := flags.String("tree", "", "expected GitHub merge-tree SHA")
 	nonce := flags.String("nonce", "", "expected job nonce")
 	modeValue := flags.String("mode", string(githubapp.ShadowMode), "shadow or enforce")
 	if err := flags.Parse(arguments); err != nil {
 		return usageError(err)
 	}
-	if *policyPath == "" || *publicKeyPath == "" || *head == "" || *base == "" {
-		return usageError(errors.New("--policy, --public-key, --head, and --base are required"))
+	if *policyPath == "" || *publicKeyPath == "" || *head == "" || *base == "" || *tree == "" || *nonce == "" {
+		return usageError(errors.New("--policy, --public-key, --head, --base, --tree, and --nonce are required"))
 	}
 	mode := githubapp.Mode(*modeValue)
 	if mode != githubapp.ShadowMode && mode != githubapp.EnforceMode {
@@ -272,6 +355,7 @@ func checkCommand(arguments []string, output io.Writer) *commandError {
 	if err != nil {
 		return operationalError(err)
 	}
+	expected.TreeSHA = *tree
 	result := githubapp.Evaluate(store.New(*storePath), publicKey, expected, mode)
 	if err := writeJSON(output, result); err != nil {
 		return err
@@ -286,6 +370,7 @@ func containerExecCommand(arguments []string, output io.Writer) *commandError {
 	flags := flag.NewFlagSet("container-exec", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	image := flags.String("image", "", "immutable container image digest")
+	platform := flags.String("platform", containerexec.DefaultPlatform, "container platform")
 	network := flags.String("network", "none", "container network: none or bridge")
 	memory := flags.String("memory", "8g", "container memory limit")
 	cpus := flags.String("cpus", "6", "container CPU limit")
@@ -304,6 +389,7 @@ func containerExecCommand(arguments []string, output io.Writer) *commandError {
 	defer stop()
 	result, err := containerexec.Run(runContext, containerexec.Options{
 		Image:     *image,
+		Platform:  *platform,
 		Network:   *network,
 		Memory:    *memory,
 		CPUs:      *cpus,
@@ -340,8 +426,9 @@ func serveCommand(arguments []string, output io.Writer) *commandError {
 	clientID := os.Getenv("CIHASH_GITHUB_CLIENT_ID")
 	privateKeyPath := os.Getenv("CIHASH_GITHUB_PRIVATE_KEY_PATH")
 	webhookSecret := os.Getenv("CIHASH_GITHUB_WEBHOOK_SECRET")
-	if clientID == "" || privateKeyPath == "" || webhookSecret == "" {
-		return operationalError(errors.New("CIHASH_GITHUB_CLIENT_ID, CIHASH_GITHUB_PRIVATE_KEY_PATH, and CIHASH_GITHUB_WEBHOOK_SECRET are required"))
+	producerToken := os.Getenv("CIHASH_PRODUCER_TOKEN")
+	if clientID == "" || privateKeyPath == "" || webhookSecret == "" || producerToken == "" {
+		return operationalError(errors.New("CIHASH_GITHUB_CLIENT_ID, CIHASH_GITHUB_PRIVATE_KEY_PATH, CIHASH_GITHUB_WEBHOOK_SECRET, and CIHASH_PRODUCER_TOKEN are required"))
 	}
 	privateKey, err := githubapi.LoadRSAPrivateKey(privateKeyPath)
 	if err != nil {
@@ -360,7 +447,7 @@ func serveCommand(arguments []string, output io.Writer) *commandError {
 		return operationalError(err)
 	}
 	logger := log.New(os.Stderr, "cihash: ", log.LstdFlags|log.LUTC)
-	webhookServer, err := hosted.NewServer(configured, []byte(webhookSecret), configuredPolicy, receiptPublicKey, githubClient, logger)
+	webhookServer, err := hosted.NewServer(configured, []byte(webhookSecret), []byte(producerToken), configuredPolicy, receiptPublicKey, githubClient, logger)
 	if err != nil {
 		return operationalError(err)
 	}
@@ -418,7 +505,10 @@ func serveCommand(arguments []string, output io.Writer) *commandError {
 }
 
 func labCommand(arguments []string, output io.Writer) *commandError {
-	const usage = "usage: cihash lab <trust-quorum|applicability|confirmer|tree-isolation>"
+	const usage = "usage: cihash lab <trust-quorum|applicability|confirmer|tree-isolation|shadow-report>"
+	if len(arguments) > 0 && arguments[0] == "shadow-report" {
+		return shadowReportCommand(arguments[1:], output)
+	}
 	if len(arguments) != 1 {
 		return usageError(errors.New(usage))
 	}
@@ -451,12 +541,27 @@ func labCommand(arguments []string, output io.Writer) *commandError {
 	return nil
 }
 
-func newNonce() (string, error) {
-	value := make([]byte, 32)
-	if _, err := rand.Read(value); err != nil {
-		return "", fmt.Errorf("generate nonce: %w", err)
+func shadowReportCommand(arguments []string, output io.Writer) *commandError {
+	flags := flag.NewFlagSet("shadow-report", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	stateDirectory := flags.String("state-directory", "", "hosted service state directory")
+	if err := flags.Parse(arguments); err != nil {
+		return usageError(err)
 	}
-	return base64.RawURLEncoding.EncodeToString(value), nil
+	if *stateDirectory == "" {
+		return usageError(errors.New("--state-directory is required"))
+	}
+	report, err := shadow.New(*stateDirectory).Report(time.Now().UTC())
+	if err != nil {
+		return operationalError(err)
+	}
+	if err := writeJSON(output, report); err != nil {
+		return err
+	}
+	if !report.EnforcementReady {
+		return operationalError(errors.New("shadow evidence does not satisfy the enforcement gate"))
+	}
+	return nil
 }
 
 func defaultStorePath() string {
@@ -485,5 +590,5 @@ func operationalError(err error) *commandError {
 }
 
 func printUsage(output io.Writer) {
-	fmt.Fprintln(output, "usage: cihash <keygen|policy|run|container-exec|verify|check|serve|lab|version> [options]")
+	fmt.Fprintln(output, "usage: cihash <keygen|policy|run|hosted-run|container-exec|verify|check|serve|lab|version> [options]")
 }

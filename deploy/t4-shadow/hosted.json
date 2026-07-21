@@ -8,5 +8,8 @@
   "receiptStore": "/srv/cihash/receipts",
   "stateDirectory": "/srv/cihash/state",
   "mode": "shadow",
+  "shadowWorkflow": "CI",
+  "shadowJob": "tooling",
+  "buildMode": "production",
   "detailsUrl": "https://github.com/apps/cihash-t4-shadow"
 }

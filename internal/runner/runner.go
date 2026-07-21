@@ -1,27 +1,33 @@
 package runner
 
 import (
-	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
 	"github.com/wolfiesch/cihash/internal/attestation"
-	"github.com/wolfiesch/cihash/internal/policy"
+	"github.com/wolfiesch/cihash/internal/containerexec"
+	"github.com/wolfiesch/cihash/internal/gitexec"
+	"github.com/wolfiesch/cihash/internal/rungrant"
+	"github.com/wolfiesch/cihash/internal/treesource"
 )
+
+type ContainerConfig struct {
+	DockerBinary   string
+	MaxTreeEntries int
+	MaxTreeBytes   int64
+}
 
 type Request struct {
 	RepositoryPath string
-	HeadRevision   string
-	BaseRevision   string
-	Policy         policy.Policy
-	Nonce          string
+	Grant          rungrant.Grant
+	Container      ContainerConfig
 }
 
 type Outcome struct {
@@ -30,26 +36,26 @@ type Outcome struct {
 }
 
 func Run(ctx context.Context, request Request) (Outcome, error) {
-	if strings.TrimSpace(request.Nonce) == "" {
-		return Outcome{}, fmt.Errorf("runner nonce is required")
-	}
-	if err := request.Policy.Validate(); err != nil {
+	if err := request.Grant.Validate(); err != nil {
 		return Outcome{}, err
 	}
-	repositoryPath, err := filepath.Abs(request.RepositoryPath)
+	repositoryPath, err := repositoryPath(request.RepositoryPath)
 	if err != nil {
-		return Outcome{}, fmt.Errorf("resolve repository path: %w", err)
-	}
-	if err := requireCleanRepository(ctx, repositoryPath); err != nil {
 		return Outcome{}, err
 	}
-	headSHA, err := resolveCommit(ctx, repositoryPath, request.HeadRevision)
+	headSHA, baseSHA, err := ResolveRevisions(ctx, repositoryPath, request.Grant.HeadSHA, request.Grant.BaseSHA)
 	if err != nil {
-		return Outcome{}, fmt.Errorf("resolve head: %w", err)
+		return Outcome{}, err
 	}
-	baseSHA, err := resolveCommit(ctx, repositoryPath, request.BaseRevision)
+	if !strings.EqualFold(headSHA, request.Grant.HeadSHA) || !strings.EqualFold(baseSHA, request.Grant.BaseSHA) {
+		return Outcome{}, fmt.Errorf("repository revisions do not match the run grant")
+	}
+	treeSHA, err := ResolveMergeTree(ctx, repositoryPath, baseSHA, headSHA)
 	if err != nil {
-		return Outcome{}, fmt.Errorf("resolve base: %w", err)
+		return Outcome{}, err
+	}
+	if !strings.EqualFold(treeSHA, request.Grant.TreeSHA) {
+		return Outcome{}, fmt.Errorf("repository merge tree does not match the run grant")
 	}
 
 	temporaryRoot, err := os.MkdirTemp("", "cihash-run-*")
@@ -57,77 +63,84 @@ func Run(ctx context.Context, request Request) (Outcome, error) {
 		return Outcome{}, fmt.Errorf("create runner workspace: %w", err)
 	}
 	defer os.RemoveAll(temporaryRoot)
-	workspace := filepath.Join(temporaryRoot, "repository")
-	if output, err := runGit(ctx, "", "clone", "--no-checkout", "--local", repositoryPath, workspace); err != nil {
-		return Outcome{}, fmt.Errorf("clone committed repository: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-	if output, err := runGit(ctx, workspace, "checkout", "--detach", "--force", headSHA); err != nil {
-		return Outcome{}, fmt.Errorf("checkout head: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-	if output, err := runGit(ctx, workspace, "-c", "user.name=CIHash", "-c", "user.email=cihash@example.invalid", "merge", "--no-commit", "--no-ff", "--no-verify", baseSHA); err != nil {
-		return Outcome{}, fmt.Errorf("prepare tested merge tree: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-	treeOutput, err := runGit(ctx, workspace, "write-tree")
-	if err != nil {
-		return Outcome{}, fmt.Errorf("resolve tested tree: %w", err)
-	}
-	treeSHA := strings.TrimSpace(string(treeOutput))
-	if output, err := runGit(ctx, workspace, "remote", "remove", "origin"); err != nil {
-		return Outcome{}, fmt.Errorf("remove cloned remote: %w: %s", err, strings.TrimSpace(string(output)))
+	workspace := filepath.Join(temporaryRoot, "source")
+	if _, err := treesource.Materialize(ctx, treesource.Options{
+		RepositoryPath: repositoryPath,
+		TreeSHA:        treeSHA,
+		Destination:    workspace,
+		MaxEntries:     request.Container.MaxTreeEntries,
+		MaxBytes:       request.Container.MaxTreeBytes,
+	}); err != nil {
+		return Outcome{}, fmt.Errorf("materialize tested tree: %w", err)
 	}
 
-	home := filepath.Join(temporaryRoot, "home")
-	temporaryDirectory := filepath.Join(temporaryRoot, "tmp")
-	if err := os.MkdirAll(home, 0o700); err != nil {
-		return Outcome{}, fmt.Errorf("create runner home: %w", err)
+	now := time.Now().UTC()
+	if !now.Before(request.Grant.ExpiresAt) {
+		return Outcome{}, rungrant.ErrGrantExpired
 	}
-	if err := os.MkdirAll(temporaryDirectory, 0o700); err != nil {
-		return Outcome{}, fmt.Errorf("create runner temporary directory: %w", err)
+	timeout := time.Duration(request.Grant.Policy.TimeoutSeconds) * time.Second
+	if remaining := request.Grant.ExpiresAt.Sub(now); remaining < timeout {
+		timeout = remaining
 	}
-
-	commandContext, cancel := context.WithTimeout(ctx, time.Duration(request.Policy.TimeoutSeconds)*time.Second)
+	executionContext, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	command := exec.CommandContext(commandContext, request.Policy.Command[0], request.Policy.Command[1:]...)
-	command.Dir = workspace
-	command.Env = workloadEnvironment(home, temporaryDirectory)
+	environment := request.Grant.Policy.Environment
 	startedAt := time.Now().UTC()
-	log, runError := command.CombinedOutput()
+	log, runError := containerexec.Run(executionContext, containerexec.Options{
+		Image:          environment.Image,
+		Platform:       environment.Platform,
+		Network:        environment.Network,
+		Memory:         environment.Memory,
+		CPUs:           environment.CPUs,
+		PIDsLimit:      environment.PIDsLimit,
+		MaxOutputBytes: environment.MaxOutputBytes,
+		Command:        request.Grant.Policy.Command,
+		Directory:      workspace,
+		DockerBinary:   request.Container.DockerBinary,
+	})
 	completedAt := time.Now().UTC()
+	if ctx.Err() != nil {
+		return Outcome{}, ctx.Err()
+	}
+	if !completedAt.Before(request.Grant.ExpiresAt) {
+		return Outcome{}, rungrant.ErrGrantExpired
+	}
+	timedOut := errors.Is(executionContext.Err(), context.DeadlineExceeded)
+	if errors.Is(runError, containerexec.ErrInvalidOptions) {
+		return Outcome{}, runError
+	}
+	if runError != nil && !timedOut {
+		exitCode := exitCodeFor(runError)
+		if exitCode == -1 || exitCode == 125 || exitCode == 126 || exitCode == 127 {
+			return Outcome{}, runError
+		}
+	}
+
 	exitCode := 0
 	conclusion := "success"
 	if runError != nil {
 		conclusion = "failure"
 		exitCode = exitCodeFor(runError)
 	}
-	if errors.Is(commandContext.Err(), context.DeadlineExceeded) {
+	if timedOut {
 		conclusion = "failure"
 		exitCode = -1
 		log = append(log, []byte("\n[cihash] command exceeded the approved timeout\n")...)
 	}
-
-	policyDigest, err := request.Policy.Digest()
-	if err != nil {
-		return Outcome{}, err
-	}
-	workflowDigest, err := request.Policy.WorkflowDigest()
-	if err != nil {
-		return Outcome{}, err
-	}
-	issuedAt := time.Now().UTC()
 	result := attestation.TestResult{
 		SchemaVersion:     attestation.SchemaVersion,
-		Repository:        request.Policy.Repository,
+		Repository:        request.Grant.Policy.Repository,
 		HeadSHA:           headSHA,
 		BaseSHA:           baseSHA,
 		TreeSHA:           treeSHA,
-		Profile:           request.Policy.Profile,
-		PolicyDigest:      policyDigest,
-		WorkflowDigest:    workflowDigest,
-		EnvironmentDigest: request.Policy.EnvironmentDigest(),
-		Architecture:      runtime.GOOS + "/" + runtime.GOARCH,
+		Profile:           request.Grant.Policy.Profile,
+		PolicyDigest:      request.Grant.PolicyDigest,
+		WorkflowDigest:    request.Grant.WorkflowDigest,
+		EnvironmentDigest: request.Grant.EnvironmentDigest,
+		Architecture:      request.Grant.Architecture,
 		Jobs: []attestation.JobResult{{
-			Name:        request.Policy.Profile,
-			Command:     append([]string(nil), request.Policy.Command...),
+			Name:        request.Grant.Policy.Profile,
+			Command:     append([]string(nil), request.Grant.Policy.Command...),
 			ExitCode:    exitCode,
 			Conclusion:  conclusion,
 			StartedAt:   startedAt,
@@ -135,56 +148,111 @@ func Run(ctx context.Context, request Request) (Outcome, error) {
 			LogDigest:   attestation.Digest(log),
 		}},
 		Conclusion: conclusion,
-		Nonce:      request.Nonce,
-		IssuedAt:   issuedAt,
-		ExpiresAt:  issuedAt.Add(time.Duration(request.Policy.MaxAgeSeconds) * time.Second),
+		Nonce:      request.Grant.Nonce,
+		IssuedAt:   completedAt,
+		ExpiresAt:  request.Grant.ExpiresAt,
 	}
 	return Outcome{Result: result, Log: log}, nil
 }
 
-func requireCleanRepository(ctx context.Context, repositoryPath string) error {
-	output, err := runGit(ctx, repositoryPath, "status", "--porcelain=v1", "--untracked-files=all")
+func ResolveRevisions(ctx context.Context, repository, headRevision, baseRevision string) (string, string, error) {
+	repository, err := repositoryPath(repository)
 	if err != nil {
-		return fmt.Errorf("inspect repository state: %w", err)
+		return "", "", err
 	}
-	if len(bytes.TrimSpace(output)) != 0 {
-		return fmt.Errorf("repository has uncommitted or untracked changes; commit the exact tree before running CIHash")
+	headSHA, err := resolveCommit(ctx, repository, headRevision)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve head: %w", err)
 	}
-	return nil
+	baseSHA, err := resolveCommit(ctx, repository, baseRevision)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve base: %w", err)
+	}
+	return headSHA, baseSHA, nil
 }
 
-func resolveCommit(ctx context.Context, repositoryPath, revision string) (string, error) {
+func repositoryPath(value string) (string, error) {
+	resolved, err := filepath.Abs(value)
+	if err != nil {
+		return "", fmt.Errorf("resolve repository path: %w", err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("inspect repository path: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("repository path must be a directory")
+	}
+	return resolved, nil
+}
+
+func resolveCommit(ctx context.Context, repository, revision string) (string, error) {
 	if strings.TrimSpace(revision) == "" {
 		return "", fmt.Errorf("revision is required")
 	}
-	output, err := runGit(ctx, repositoryPath, "rev-parse", "--verify", "--end-of-options", revision+"^{commit}")
+	output, err := runGit(ctx, repository, "rev-parse", "--verify", "--end-of-options", revision+"^{commit}")
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
 	}
-	return strings.TrimSpace(string(output)), nil
+	resolved := strings.TrimSpace(string(output))
+	if !validGitObjectID(resolved) {
+		return "", fmt.Errorf("Git returned an invalid commit identity")
+	}
+	return resolved, nil
+}
+
+func ResolveMergeTree(ctx context.Context, repository, baseSHA, headSHA string) (string, error) {
+	output, err := runGit(ctx, repository, "merge-tree", "--write-tree", "--no-messages", baseSHA, headSHA)
+	if err != nil {
+		return "", fmt.Errorf("compute base-plus-head merge tree: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	treeSHA := strings.TrimSpace(string(output))
+	if !validGitObjectID(treeSHA) || len(treeSHA) != len(headSHA) {
+		return "", fmt.Errorf("Git returned an invalid merge tree identity")
+	}
+	objectType, err := runGit(ctx, repository, "cat-file", "-t", treeSHA)
+	if err != nil || strings.TrimSpace(string(objectType)) != "tree" {
+		return "", fmt.Errorf("computed merge object is not a tree")
+	}
+	return treeSHA, nil
 }
 
 func runGit(ctx context.Context, directory string, arguments ...string) ([]byte, error) {
-	command := exec.CommandContext(ctx, "git", arguments...)
-	if directory != "" {
-		command.Dir = directory
-	}
-	return command.CombinedOutput()
+	return gitexec.Command(ctx, "git", directory, arguments...).CombinedOutput()
 }
 
-func workloadEnvironment(home, temporaryDirectory string) []string {
-	environment := []string{
-		"CI=1",
-		"CIHASH=1",
-		"HOME=" + home,
-		"TMPDIR=" + temporaryDirectory,
+func gitEnvironment() []string {
+	blocked := map[string]struct{}{
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES": {},
+		"GIT_CONFIG_COUNT":                 {},
+		"GIT_CONFIG_GLOBAL":                {},
+		"GIT_CONFIG_KEY_0":                 {},
+		"GIT_CONFIG_SYSTEM":                {},
+		"GIT_CONFIG_VALUE_0":               {},
+		"GIT_DIR":                          {},
+		"GIT_INDEX_FILE":                   {},
+		"GIT_OBJECT_DIRECTORY":             {},
+		"GIT_REPLACE_REF_BASE":             {},
+		"GIT_SHALLOW_FILE":                 {},
+		"GIT_WORK_TREE":                    {},
 	}
-	for _, name := range []string{"PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR"} {
-		if value, ok := os.LookupEnv(name); ok {
-			environment = append(environment, name+"="+value)
+	current := os.Environ()
+	environment := make([]string, 0, len(current)+2)
+	for _, variable := range current {
+		name, _, _ := strings.Cut(variable, "=")
+		if _, excluded := blocked[name]; !excluded && !strings.HasPrefix(name, "GIT_CONFIG_KEY_") && !strings.HasPrefix(name, "GIT_CONFIG_VALUE_") {
+			environment = append(environment, variable)
 		}
 	}
-	return environment
+	return append(environment, "GIT_NO_REPLACE_OBJECTS=1", "GIT_CONFIG_NOSYSTEM=1")
+}
+
+func validGitObjectID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func exitCodeFor(err error) int {

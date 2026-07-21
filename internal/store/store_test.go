@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -62,5 +63,45 @@ func assertSetgid(t *testing.T, path string) {
 	}
 	if info.Mode()&os.ModeSetgid == 0 {
 		t.Fatalf("mode for %s does not include setgid: %v", path, info.Mode())
+	}
+}
+
+func TestSaveForRunKeepsRunBindingsImmutableAndRefreshesIdentity(t *testing.T) {
+	root := t.TempDir()
+	evidence := New(root)
+	identity := Identity{Repository: "github.com/example/project"}
+	first := attestation.Envelope{PayloadType: attestation.PayloadType, Payload: "e30="}
+	if _, _, err := evidence.SaveForRun("run-1", identity, first, []byte("first log")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := evidence.SaveForRun("run-1", identity, first, []byte("first log")); err != nil {
+		t.Fatalf("same receipt retry = %v", err)
+	}
+	replacement := attestation.Envelope{PayloadType: attestation.PayloadType, Payload: "eyJkaWZmZXJlbnQiOnRydWV9"}
+	if _, _, err := evidence.SaveForRun("run-1", identity, replacement, []byte("second log")); !errors.Is(err, ErrConflict) {
+		t.Fatalf("same-run replacement error = %v, want ErrConflict", err)
+	}
+	stored, _, found, err := evidence.Lookup(identity)
+	if err != nil || !found || stored.Payload != first.Payload {
+		t.Fatalf("same-run conflict changed lookup evidence: found=%t err=%v envelope=%+v", found, err, stored)
+	}
+
+	if _, _, err := evidence.SaveForRun("run-2", identity, replacement, []byte("second log")); err != nil {
+		t.Fatalf("new authorized run could not refresh identity: %v", err)
+	}
+	stored, _, found, err = evidence.Lookup(identity)
+	if err != nil || !found || stored.Payload != replacement.Payload {
+		t.Fatalf("refreshed lookup evidence: found=%t err=%v envelope=%+v", found, err, stored)
+	}
+	bound, found, err := evidence.LookupEvidence(identity)
+	if err != nil || !found {
+		t.Fatalf("bound evidence lookup: found=%t err=%v", found, err)
+	}
+	replacementData, err := attestation.MarshalEnvelope(replacement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bound.RunID != "run-2" || bound.ReceiptDigest != attestation.Digest(replacementData) {
+		t.Fatalf("bound evidence = %+v", bound)
 	}
 }

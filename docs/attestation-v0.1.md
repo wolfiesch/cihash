@@ -65,7 +65,7 @@ choose the command, environment, policy, base, expiry, or nonce.
 The grant records:
 
 - an unpredictable 32-byte run ID and a distinct 32-byte nonce;
-- the exact head and base Git object IDs;
+- the exact head, base, and server-resolved GitHub merge-tree object IDs;
 - the complete approved policy plus its policy, workflow, and environment
   digests;
 - the explicit Linux execution architecture; and
@@ -76,13 +76,18 @@ The server persists the grant before returning it. Its lifecycle is monotonic:
 `issued` becomes `submitted` after a verified receipt is bound to the run, then
 becomes `consumed` after the GitHub decision uses that receipt. Submission and
 consumption must both occur before expiry. One receipt digest may be submitted
-idempotently while valid; a different digest, an early timestamp, a late
-transition, or consumption before submission is rejected.
+idempotently while valid; a different digest, a receipt predating issuance, a
+late transition, or consumption before submission is rejected.
 
 The run ID and nonce are proof bindings, not client authentication credentials.
 Receipt submission requires a separate authenticated producer channel. The
 grant JSON is not itself signed; the server-owned stored record is authoritative,
 and receipt acceptance compares the signed predicate to that record.
+
+The signed receipt `issuedAt` is its completion/signing time, not the earlier
+grant issuance time. The verifier requires execution and receipt issuance to
+fall within the server-persisted grant window and requires the receipt's exact
+expiry to match the grant.
 
 ## Statement
 

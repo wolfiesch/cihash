@@ -20,7 +20,9 @@ import (
 	"github.com/wolfiesch/cihash/internal/githubapi"
 	"github.com/wolfiesch/cihash/internal/githubapp"
 	"github.com/wolfiesch/cihash/internal/policy"
+	"github.com/wolfiesch/cihash/internal/rungrant"
 	"github.com/wolfiesch/cihash/internal/store"
+	"github.com/wolfiesch/cihash/internal/verifier"
 )
 
 func TestWebhookRejectsInvalidSignature(t *testing.T) {
@@ -40,7 +42,7 @@ func TestWebhookRejectsInvalidSignature(t *testing.T) {
 }
 
 func TestPullRequestAcceptsExactProof(t *testing.T) {
-	server, client, secret, headSHA, _ := hostedFixture(t, githubapp.EnforceMode, true)
+	server, client, secret, headSHA, baseSHA := hostedFixture(t, githubapp.EnforceMode, true)
 	response := sendWebhook(t, server, secret, "pull_request", "delivery-accepted", pullRequestBody(strings.Repeat("d", 40), strings.Repeat("e", 40)))
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
@@ -54,6 +56,69 @@ func TestPullRequestAcceptsExactProof(t *testing.T) {
 	}
 	if len(client.dispatches) != 0 {
 		t.Fatal("accepted proof dispatched fallback")
+	}
+	expected, err := verifier.ExpectedFromPolicy(server.policy, headSHA, baseSHA, "", server.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, found, err := server.receiptStore.LookupEvidence(store.Identity{
+		Repository: expected.Repository, HeadSHA: expected.HeadSHA, BaseSHA: expected.BaseSHA,
+		Profile: expected.Profile, PolicyDigest: expected.PolicyDigest,
+		WorkflowDigest: expected.WorkflowDigest, EnvironmentDigest: expected.EnvironmentDigest,
+	})
+	if err != nil || !found {
+		t.Fatalf("bound evidence: found=%t err=%v", found, err)
+	}
+	record, found, err := server.grantStore.Lookup(evidence.RunID, server.now())
+	if err != nil || !found || record.Status != rungrant.StatusConsumed {
+		t.Fatalf("consumed run: found=%t err=%v record=%+v", found, err, record)
+	}
+}
+func TestPullRequestRejectsProofWithoutServerRunBinding(t *testing.T) {
+	server, client, secret, headSHA, baseSHA := hostedFixture(t, githubapp.EnforceMode, true)
+	expected, err := verifier.ExpectedFromPolicy(server.policy, headSHA, baseSHA, "", server.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := store.Identity{
+		Repository: expected.Repository, HeadSHA: expected.HeadSHA, BaseSHA: expected.BaseSHA,
+		Profile: expected.Profile, PolicyDigest: expected.PolicyDigest,
+		WorkflowDigest: expected.WorkflowDigest, EnvironmentDigest: expected.EnvironmentDigest,
+	}
+	evidence, found, err := server.receiptStore.LookupEvidence(identity)
+	if err != nil || !found {
+		t.Fatalf("bound evidence: found=%t err=%v", found, err)
+	}
+	if _, _, err := server.receiptStore.Save(identity, evidence.Envelope, []byte("passed")); err != nil {
+		t.Fatal(err)
+	}
+
+	response := sendWebhook(t, server, secret, "pull_request", "delivery-unbound", pullRequestBody(headSHA, baseSHA))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if len(client.createdChecks) != 1 || client.createdChecks[0].Status != "queued" ||
+		!strings.Contains(client.createdChecks[0].Output.Summary, "run_unbound") {
+		t.Fatalf("check = %+v, want queued run_unbound rejection", client.createdChecks)
+	}
+	if len(client.dispatches) != 1 {
+		t.Fatalf("dispatches = %d, want fallback", len(client.dispatches))
+	}
+}
+
+func TestPullRequestRejectsChangedAuthoritativeMergeTree(t *testing.T) {
+	server, client, secret, headSHA, baseSHA := hostedFixture(t, githubapp.EnforceMode, true)
+	client.pullRequest = githubapi.PullRequestState{
+		HeadSHA: headSHA, BaseSHA: baseSHA, TreeSHA: strings.Repeat("d", 40),
+		HeadRepository: "owner/project", BaseRef: "main",
+	}
+	response := sendWebhook(t, server, secret, "pull_request", "delivery-tree-changed", pullRequestBody(headSHA, baseSHA))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if len(client.createdChecks) != 1 || client.createdChecks[0].Status != "queued" ||
+		!strings.Contains(client.createdChecks[0].Output.Summary, "tree_mismatch") {
+		t.Fatalf("check = %+v, want queued tree_mismatch rejection", client.createdChecks)
 	}
 }
 
@@ -132,6 +197,57 @@ func TestFallbackDispatchFailureKeepsConfiguredCheckName(t *testing.T) {
 	}
 }
 
+func TestShadowEvidenceCorrelatesAcceptedProofWithSelectedActionsJob(t *testing.T) {
+	server, _, secret, headSHA, baseSHA := hostedFixture(t, githubapp.ShadowMode, true)
+	server.config.ShadowWorkflow = "CI"
+	server.config.ShadowJob = "tooling"
+	server.serviceBuild.sourceRevision = strings.Repeat("e", 40)
+	server.serviceBuild.sourceModified = false
+	server.config.BuildMode = "production"
+	if response := sendWebhook(t, server, secret, "pull_request", "delivery-shadow-proof", pullRequestBody(headSHA, baseSHA)); response.Code != http.StatusAccepted {
+		t.Fatalf("pull request status = %d, body = %s", response.Code, response.Body.String())
+	}
+	workflowBody := map[string]any{
+		"action":       "completed",
+		"repository":   map[string]any{"full_name": "owner/project"},
+		"installation": map[string]any{"id": 123},
+		"workflow_run": map[string]any{
+			"id":         99,
+			"name":       "CI",
+			"head_sha":   headSHA,
+			"status":     "completed",
+			"conclusion": "failure",
+			"updated_at": "2026-07-20T12:02:00Z",
+		},
+	}
+	if response := sendWebhook(t, server, secret, "workflow_run", "delivery-shadow-workflow", workflowBody); response.Code != http.StatusAccepted {
+		t.Fatalf("workflow status = %d, body = %s", response.Code, response.Body.String())
+	}
+	report, err := server.shadowStore.Report(server.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Matches != 1 || report.Mismatches != 0 || !report.EnforcementReady {
+		t.Fatalf("shadow report = %+v", report)
+	}
+	if report.Observations[0].Workflow.Name != "tooling" || report.Observations[0].Workflow.DurationMillis != int64(time.Minute/time.Millisecond) {
+		t.Fatalf("workflow evidence = %+v", report.Observations[0].Workflow)
+	}
+}
+
+func TestPullRequestEditedReevaluatesCurrentBase(t *testing.T) {
+	server, client, secret, headSHA, baseSHA := hostedFixture(t, githubapp.ShadowMode, false)
+	body := pullRequestBody(headSHA, baseSHA)
+	body["action"] = "edited"
+	response := sendWebhook(t, server, secret, "pull_request", "delivery-edited", body)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if len(client.createdChecks) != 1 {
+		t.Fatalf("created checks = %d, want 1", len(client.createdChecks))
+	}
+}
+
 func TestConfigRejectsConflictingWebhookPaths(t *testing.T) {
 	base := Config{
 		WebhookPath:          "/webhooks/github",
@@ -146,7 +262,7 @@ func TestConfigRejectsConflictingWebhookPaths(t *testing.T) {
 	if err := base.Validate(); err != nil {
 		t.Fatalf("default webhook path rejected: %v", err)
 	}
-	for _, webhookPath := range []string{"/health", "/", "/webhooks/../health", "/webhooks/{event}", "/webhooks/github?event=pull_request"} {
+	for _, webhookPath := range []string{"/health", "/", "/webhooks/../health", "/webhooks/{event}", "/webhooks/github?event=pull_request", runsEndpoint, runsEndpoint + "/x/receipt"} {
 		configured := base
 		configured.WebhookPath = webhookPath
 		if err := configured.Validate(); err == nil {
@@ -161,6 +277,7 @@ type fakeGitHubClient struct {
 	updatedChecks []recordedUpdate
 	dispatches    []recordedDispatch
 	dispatchErr   error
+	pullRequest   githubapi.PullRequestState
 }
 
 type recordedUpdate struct {
@@ -185,12 +302,24 @@ func (client *fakeGitHubClient) GetPullRequest(_ context.Context, token, reposit
 	if token != "installation-token" || repository != "owner/project" || number != 7 {
 		return githubapi.PullRequestState{}, io.ErrUnexpectedEOF
 	}
+	if client.pullRequest.HeadSHA != "" {
+		return client.pullRequest, nil
+	}
 	return githubapi.PullRequestState{
 		HeadSHA:        strings.Repeat("a", 40),
 		HeadRepository: "owner/project",
 		BaseSHA:        strings.Repeat("b", 40),
 		BaseRef:        "main",
+		TreeSHA:        strings.Repeat("c", 40),
 	}, nil
+}
+
+func (client *fakeGitHubClient) GetWorkflowJob(_ context.Context, token, repository string, runID int64, jobName string) (githubapi.WorkflowJob, error) {
+	if token != "installation-token" || repository != "owner/project" || runID != 99 || jobName != "tooling" {
+		return githubapi.WorkflowJob{}, io.ErrUnexpectedEOF
+	}
+	startedAt := time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)
+	return githubapi.WorkflowJob{ID: 101, Name: jobName, Conclusion: "success", StartedAt: startedAt, CompletedAt: startedAt.Add(time.Minute)}, nil
 }
 
 func (client *fakeGitHubClient) CreateCheckRun(_ context.Context, token, repository string, request githubapp.CheckRunRequest) (int64, error) {
@@ -232,7 +361,7 @@ func hostedFixture(t *testing.T, mode githubapp.Mode, withProof bool) (*Server, 
 		Repository:     "github.com/owner/project",
 		Profile:        "verify",
 		Command:        []string{"go", "test", "./..."},
-		Environment:    "oci://runner@sha256:approved",
+		Environment:    hostedTestEnvironment(),
 		MaxAgeSeconds:  3600,
 		TimeoutSeconds: 900,
 	}
@@ -251,7 +380,7 @@ func hostedFixture(t *testing.T, mode githubapp.Mode, withProof bool) (*Server, 
 	}
 	client := &fakeGitHubClient{}
 	secret := []byte("0123456789abcdef0123456789abcdef")
-	server, err := NewServer(config, secret, configuredPolicy, publicKey, client, log.New(io.Discard, "", 0))
+	server, err := NewServer(config, secret, secret, configuredPolicy, publicKey, client, log.New(io.Discard, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,12 +389,12 @@ func hostedFixture(t *testing.T, mode githubapp.Mode, withProof bool) (*Server, 
 	headSHA := strings.Repeat("a", 40)
 	baseSHA := strings.Repeat("b", 40)
 	if withProof {
-		policyDigest, err := configuredPolicy.Digest()
+		treeSHA := strings.Repeat("c", 40)
+		grant, err := rungrant.Issue(configuredPolicy, headSHA, baseSHA, treeSHA, fixedNow.Add(-2*time.Minute))
 		if err != nil {
 			t.Fatal(err)
 		}
-		workflowDigest, err := configuredPolicy.WorkflowDigest()
-		if err != nil {
+		if _, err := server.grantStore.Create(grant); err != nil {
 			t.Fatal(err)
 		}
 		result := attestation.TestResult{
@@ -273,12 +402,12 @@ func hostedFixture(t *testing.T, mode githubapp.Mode, withProof bool) (*Server, 
 			Repository:        configuredPolicy.Repository,
 			HeadSHA:           headSHA,
 			BaseSHA:           baseSHA,
-			TreeSHA:           strings.Repeat("c", 40),
+			TreeSHA:           treeSHA,
 			Profile:           configuredPolicy.Profile,
-			PolicyDigest:      policyDigest,
-			WorkflowDigest:    workflowDigest,
-			EnvironmentDigest: configuredPolicy.EnvironmentDigest(),
-			Architecture:      "linux/amd64",
+			PolicyDigest:      grant.PolicyDigest,
+			WorkflowDigest:    grant.WorkflowDigest,
+			EnvironmentDigest: grant.EnvironmentDigest,
+			Architecture:      grant.Architecture,
 			Jobs: []attestation.JobResult{{
 				Name:        configuredPolicy.Profile,
 				Command:     configuredPolicy.Command,
@@ -288,15 +417,23 @@ func hostedFixture(t *testing.T, mode githubapp.Mode, withProof bool) (*Server, 
 				LogDigest:   attestation.Digest([]byte("passed")),
 			}},
 			Conclusion: "success",
-			Nonce:      "server-issued-nonce",
+			Nonce:      grant.Nonce,
 			IssuedAt:   fixedNow,
-			ExpiresAt:  fixedNow.Add(time.Hour),
+			ExpiresAt:  grant.ExpiresAt,
 		}
 		envelope, err := attestation.Sign(attestation.NewStatement(result), privateKey)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := store.New(config.ReceiptStore).Save(store.IdentityFromResult(result), envelope, []byte("passed")); err != nil {
+		envelopeData, err := attestation.MarshalEnvelope(envelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receiptDigest := attestation.Digest(envelopeData)
+		if _, err := server.grantStore.MarkSubmitted(grant.ID, receiptDigest, fixedNow); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := store.New(config.ReceiptStore).SaveForRun(grant.ID, store.IdentityFromResult(result), envelope, []byte("passed")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -314,6 +451,18 @@ func pullRequestBody(headSHA, baseSHA string) map[string]any {
 			"head":  map[string]any{"sha": headSHA, "ref": "feature"},
 			"base":  map[string]any{"sha": baseSHA, "ref": "main"},
 		},
+	}
+}
+
+func hostedTestEnvironment() policy.Environment {
+	return policy.Environment{
+		Image:          "sha256:" + strings.Repeat("a", 64),
+		Platform:       "linux/amd64",
+		Network:        "none",
+		Memory:         "8g",
+		CPUs:           "6",
+		PIDsLimit:      1024,
+		MaxOutputBytes: 16 << 20,
 	}
 }
 

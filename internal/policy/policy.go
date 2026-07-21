@@ -8,19 +8,69 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
 const Version = "0.1"
 
+var (
+	imagePattern    = regexp.MustCompile(`^(?:[a-z0-9][a-z0-9._/-]*@)?sha256:[0-9a-f]{64}$`)
+	memoryPattern   = regexp.MustCompile(`^[1-9][0-9]*[mg]$`)
+	platformPattern = regexp.MustCompile(`^linux/(?:amd64|arm64)$`)
+	cpusPattern     = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+)?$`)
+)
+
+const MaxOutputBytes = int64(64 << 20)
+
+type Environment struct {
+	Image          string `json:"image"`
+	Platform       string `json:"platform"`
+	Network        string `json:"network"`
+	Memory         string `json:"memory"`
+	CPUs           string `json:"cpus"`
+	PIDsLimit      int    `json:"pidsLimit"`
+	MaxOutputBytes int64  `json:"maxOutputBytes"`
+}
+
+func (environment Environment) Validate() error {
+	if !imagePattern.MatchString(environment.Image) {
+		return fmt.Errorf("policy environment image must be pinned by sha256 digest")
+	}
+	if !platformPattern.MatchString(environment.Platform) {
+		return fmt.Errorf("policy environment platform must be linux/amd64 or linux/arm64")
+	}
+	if environment.Network != "none" {
+		return fmt.Errorf("policy environment network must be none")
+	}
+	if !memoryPattern.MatchString(environment.Memory) {
+		return fmt.Errorf("policy environment memory must use a positive m or g suffix")
+	}
+	if !cpusPattern.MatchString(environment.CPUs) {
+		return fmt.Errorf("policy environment cpus must be positive")
+	}
+	cpus, err := strconv.ParseFloat(environment.CPUs, 64)
+	if err != nil || cpus <= 0 {
+		return fmt.Errorf("policy environment cpus must be positive")
+	}
+	if environment.PIDsLimit < 1 {
+		return fmt.Errorf("policy environment pidsLimit must be positive")
+	}
+	if environment.MaxOutputBytes < 1 || environment.MaxOutputBytes > MaxOutputBytes {
+		return fmt.Errorf("policy environment maxOutputBytes must be between 1 and %d", MaxOutputBytes)
+	}
+	return nil
+}
+
 type Policy struct {
-	Version        string   `json:"version"`
-	Repository     string   `json:"repository"`
-	Profile        string   `json:"profile"`
-	Command        []string `json:"command"`
-	Environment    string   `json:"environment"`
-	MaxAgeSeconds  int64    `json:"maxAgeSeconds"`
-	TimeoutSeconds int64    `json:"timeoutSeconds"`
+	Version        string      `json:"version"`
+	Repository     string      `json:"repository"`
+	Profile        string      `json:"profile"`
+	Command        []string    `json:"command"`
+	Environment    Environment `json:"environment"`
+	MaxAgeSeconds  int64       `json:"maxAgeSeconds"`
+	TimeoutSeconds int64       `json:"timeoutSeconds"`
 }
 
 func Load(path string) (Policy, []byte, error) {
@@ -65,8 +115,8 @@ func (p Policy) Validate() error {
 			return fmt.Errorf("policy command contains a null byte")
 		}
 	}
-	if strings.TrimSpace(p.Environment) == "" {
-		return fmt.Errorf("policy environment is required")
+	if err := p.Environment.Validate(); err != nil {
+		return err
 	}
 	if p.MaxAgeSeconds < 1 || p.MaxAgeSeconds > 24*60*60 {
 		return fmt.Errorf("policy maxAgeSeconds must be between 1 and 86400")
@@ -107,7 +157,8 @@ func (p Policy) WorkflowDigest() (string, error) {
 }
 
 func (p Policy) EnvironmentDigest() string {
-	return digest([]byte(p.Environment))
+	data, _ := json.Marshal(p.Environment)
+	return digest(data)
 }
 
 func digest(data []byte) string {

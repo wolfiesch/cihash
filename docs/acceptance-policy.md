@@ -12,28 +12,43 @@ The v0.1 local policy is JSON:
   "repository": "github.com/acme/project",
   "profile": "verify",
   "command": ["go", "test", "./..."],
-  "environment": "oci://registry.example/cihash/go@sha256:<digest>",
+  "environment": {
+    "image": "registry.example/cihash/go@sha256:<digest>",
+    "platform": "linux/amd64",
+    "network": "none",
+    "memory": "8g",
+    "cpus": "6",
+    "pidsLimit": 1024,
+    "maxOutputBytes": 16777216
+  },
   "maxAgeSeconds": 3600,
   "timeoutSeconds": 900
 }
 ```
 
-The policy digest is SHA-256 over its canonical JSON representation. The workflow digest separately commits to the profile and command. The environment digest commits to the immutable environment identity.
+The policy digest is SHA-256 over its canonical JSON representation. The
+workflow digest separately commits to the profile and command. The environment
+digest commits to canonical JSON for the pinned image, Linux platform, disabled
+network, resource limits, and output bound. Every environment field is explicit;
+the producer cannot override one at execution time.
 
-`maxAgeSeconds` is limited to 24 hours. `timeoutSeconds` is limited to two hours. The local runner enforces the timeout and records a signed failure when the command exceeds it.
+`maxAgeSeconds` is limited to 24 hours. `timeoutSeconds` is limited to two hours.
+The trusted runner enforces the timeout and signs only a bounded execution log.
 
 ## Decision order
 
 The verifier evaluates in this order and stops at the first rejection:
 
 1. receipt exists for the expected lookup identity;
-2. envelope and statement decode under supported versions;
-3. signer key is trusted and signature is valid;
-4. subject and predicate are internally consistent;
-5. repository, head, base, profile, policy, workflow, and environment match;
-6. issuance and expiry are valid;
-7. required jobs are complete and unique;
-8. every job and the overall receipt succeeded.
+2. evidence is immutably bound to a submitted, unexpired server-issued run;
+3. submitted receipt digest matches the stored evidence;
+4. signer key is trusted and signature is valid;
+5. subject and predicate are internally consistent;
+6. repository, head, base, GitHub merge tree, profile, policy, workflow, environment, architecture, and nonce match;
+7. issuance and expiry are valid for the run grant;
+8. required jobs are complete and unique;
+9. every job and the overall receipt succeeded;
+10. run consumption succeeds before a success check is published.
 
 ## Stable rejection codes
 
@@ -46,13 +61,21 @@ The verifier evaluates in this order and stops at the first rejection:
 - `repository_mismatch`
 - `head_mismatch`
 - `base_mismatch`
+- `tree_mismatch`
 - `profile_mismatch`
 - `policy_mismatch`
 - `workflow_mismatch`
 - `environment_mismatch`
+- `architecture_mismatch`
 - `not_yet_valid`
 - `expired`
+- `issued_at_mismatch`
+- `expiry_mismatch`
 - `nonce_invalid`
+- `run_unbound`
+- `run_unsubmitted`
+- `run_state_invalid`
+- `receipt_digest_mismatch`
 - `job_set_mismatch`
 - `job_failed`
 - `proof_failed`
