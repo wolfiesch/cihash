@@ -48,6 +48,37 @@ func TestMaterializeCreatesMetadataFreeExactTree(t *testing.T) {
 	}
 }
 
+func TestMaterializeSupportsSHA256ObjectStores(t *testing.T) {
+	repository, treeSHA, _ := testGitTreeWithFormat(t, "sha256")
+	objectDirectory := filepath.Join(repository, ".git", "objects")
+	alternateObjectDirectory := filepath.Join(t.TempDir(), "alternate-objects")
+	if err := os.Mkdir(alternateObjectDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string]Options{
+		"ordinary repository": {},
+		"isolated object view": {
+			GitDirectory:             filepath.Join(repository, ".git"),
+			ObjectDirectory:          objectDirectory,
+			AlternateObjectDirectory: alternateObjectDirectory,
+		},
+	}
+	for name, options := range tests {
+		t.Run(name, func(t *testing.T) {
+			options.RepositoryPath = repository
+			options.TreeSHA = treeSHA
+			options.Destination = filepath.Join(t.TempDir(), "materialized")
+			result, err := Materialize(context.Background(), options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.TreeSHA != treeSHA {
+				t.Fatalf("Materialize tree SHA = %q, want %q", result.TreeSHA, treeSHA)
+			}
+		})
+	}
+}
+
 func TestMaterializeRejectsCommitAndCleansLimitedExtraction(t *testing.T) {
 	repository, treeSHA, commitSHA := testGitTree(t)
 	if _, err := Materialize(context.Background(), Options{
@@ -72,19 +103,37 @@ func TestMaterializeRejectsCommitAndCleansLimitedExtraction(t *testing.T) {
 	}
 }
 
-func TestMaterializeRejectsArchiveAttributesAndGitlinks(t *testing.T) {
+func TestMaterializePreservesBlobBytesDespiteArchiveAttributes(t *testing.T) {
 	repository, _, commitSHA := testGitTree(t)
-	if err := os.WriteFile(filepath.Join(repository, ".gitattributes"), []byte("README.txt export-ignore\n"), 0o644); err != nil {
+	attributes := "README.txt export-ignore text eol=crlf\nVERSION.txt export-subst\n"
+	if err := os.WriteFile(filepath.Join(repository, ".gitattributes"), []byte(attributes), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	runTestGit(t, repository, "add", "--", ".gitattributes")
-	exportIgnoredTree := runTestGit(t, repository, "write-tree")
+	const version = "$Format:%H$\n"
+	if err := os.WriteFile(filepath.Join(repository, "VERSION.txt"), []byte(version), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runTestGit(t, repository, "add", "--", ".gitattributes", "VERSION.txt")
+	attributedTree := runTestGit(t, repository, "write-tree")
+	destination := filepath.Join(t.TempDir(), "archive-attributes")
 	if _, err := Materialize(context.Background(), Options{
 		RepositoryPath: repository,
-		TreeSHA:        exportIgnoredTree,
-		Destination:    filepath.Join(t.TempDir(), "export-ignore"),
-	}); err == nil || !strings.Contains(err.Error(), "archive omitted") {
-		t.Fatalf("export-ignore materialization error = %v, want omission rejection", err)
+		TreeSHA:        attributedTree,
+		Destination:    destination,
+	}); err != nil {
+		t.Fatalf("materialize attributed tree: %v", err)
+	}
+	for name, want := range map[string]string{
+		"README.txt":  "tree fixture\n",
+		"VERSION.txt": version,
+	} {
+		content, err := os.ReadFile(filepath.Join(destination, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(content) != want {
+			t.Fatalf("%s content = %q, want exact blob bytes %q", name, content, want)
+		}
 	}
 
 	runTestGit(t, repository, "update-index", "--add", "--cacheinfo", "160000,"+commitSHA+",vendor/submodule")
@@ -214,11 +263,16 @@ func testTar(t *testing.T, fixtures []tarFixture) []byte {
 
 func testGitTree(t *testing.T) (string, string, string) {
 	t.Helper()
+	return testGitTreeWithFormat(t, "sha1")
+}
+
+func testGitTreeWithFormat(t *testing.T, objectFormat string) (string, string, string) {
+	t.Helper()
 	repository := filepath.Join(t.TempDir(), "repository")
 	if err := os.Mkdir(repository, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	runTestGit(t, repository, "init", "--quiet")
+	runTestGit(t, repository, "init", "--quiet", "--object-format="+objectFormat)
 	if err := os.Mkdir(filepath.Join(repository, "bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}

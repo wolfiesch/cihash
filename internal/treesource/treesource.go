@@ -27,6 +27,7 @@ const (
 	DefaultMaxEntries      = 100_000
 	DefaultMaxBytes        = int64(1 << 30)
 	maxManifestRecordBytes = 1 << 20
+	exactArchiveAttributes = "* -text -eol -crlf -working-tree-encoding -ident -filter -export-ignore -export-subst\n"
 )
 
 type Options struct {
@@ -118,7 +119,11 @@ func Materialize(ctx context.Context, options Options) (result Result, err error
 		}
 	}()
 
-	archive := gitCommand(ctx, git, repository, options, "archive", "--format=tar", options.TreeSHA)
+	archive, cleanupArchive, err := exactArchiveCommand(ctx, git, repository, options, options.TreeSHA)
+	if err != nil {
+		return Result{}, err
+	}
+	defer cleanupArchive()
 	var stderr bytes.Buffer
 	archive.Stderr = &stderr
 	stdout, err := archive.StdoutPipe()
@@ -152,6 +157,71 @@ func gitCommand(ctx context.Context, git, repository string, options Options, ar
 		return gitexec.ObjectCommand(ctx, git, options.GitDirectory, options.ObjectDirectory, options.AlternateObjectDirectory, arguments...)
 	}
 	return gitexec.Command(ctx, git, repository, arguments...)
+}
+
+func exactArchiveCommand(ctx context.Context, git, repository string, options Options, treeSHA string) (*exec.Cmd, func(), error) {
+	objectDirectory := options.ObjectDirectory
+	alternateObjectDirectory := options.AlternateObjectDirectory
+	formatOutput, err := gitCommand(ctx, git, repository, options, "rev-parse", "--show-object-format=storage").CombinedOutput()
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve Git object format: %w: %s", err, strings.TrimSpace(string(formatOutput)))
+	}
+	objectFormat := strings.TrimSpace(string(formatOutput))
+	if objectFormat != "sha1" && objectFormat != "sha256" {
+		return nil, nil, fmt.Errorf("unsupported Git object format %q", objectFormat)
+	}
+	if objectDirectory == "" {
+		output, err := gitCommand(ctx, git, repository, options, "rev-parse", "--git-path", "objects").CombinedOutput()
+		if err != nil {
+			return nil, nil, fmt.Errorf("resolve Git object directory: %w: %s", err, strings.TrimSpace(string(output)))
+		}
+		objectDirectory = strings.TrimSpace(string(output))
+		if !filepath.IsAbs(objectDirectory) {
+			objectDirectory = filepath.Join(repository, objectDirectory)
+		}
+	}
+
+	gitDirectory, err := os.MkdirTemp("", "cihash-archive-git-*")
+	if err != nil {
+		return nil, nil, fmt.Errorf("create exact archive Git directory: %w", err)
+	}
+	cleanup := func() {
+		_ = os.RemoveAll(gitDirectory)
+	}
+	for _, directory := range []string{
+		filepath.Join(gitDirectory, "objects"),
+		filepath.Join(gitDirectory, "refs", "heads"),
+		filepath.Join(gitDirectory, "info"),
+	} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("create exact archive Git directory: %w", err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(gitDirectory, "HEAD"), []byte("ref: refs/heads/main\n"), 0o600); err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("configure exact archive Git directory: %w", err)
+	}
+	repositoryFormatVersion := "0"
+	extensions := ""
+	if objectFormat == "sha256" {
+		repositoryFormatVersion = "1"
+		extensions = "[extensions]\n\tobjectFormat = sha256\n"
+	}
+	config := fmt.Sprintf("[core]\n\trepositoryFormatVersion = %s\n\tbare = true\n%s", repositoryFormatVersion, extensions)
+	if err := os.WriteFile(filepath.Join(gitDirectory, "config"), []byte(config), 0o600); err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("configure exact archive Git object format: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDirectory, "info", "attributes"), []byte(exactArchiveAttributes), 0o600); err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("configure exact archive attributes: %w", err)
+	}
+
+	command := gitexec.ObjectCommand(ctx, git, gitDirectory, objectDirectory, alternateObjectDirectory, "archive", "--format=tar", treeSHA)
+	command.Dir = repository
+	command.Env = append(command.Env, "GIT_ATTR_NOSYSTEM=1")
+	return command, cleanup, nil
 }
 
 type manifestEntry struct {

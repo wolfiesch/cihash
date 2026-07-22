@@ -61,14 +61,16 @@ required check:
   domain names, and both canonical evidence-envelope digests;
 - `tree-isolation` materializes a metadata-free Git tree and verifies every
   tracked path, blob identity, byte size, and executable mode against
-  `git ls-tree`; it rejects commit IDs, `.git` paths, escaping symlinks, resource
-  limit violations, gitlinks, and archive omissions or transformations.
+  `git ls-tree`; a trusted attribute override prevents `git archive` export,
+  filter, encoding, and line-ending rules from changing or omitting blobs. It
+  rejects commit IDs, `.git` paths, escaping symlinks, resource limit
+  violations, gitlinks, and any remaining archive mismatch.
 
 These experiments establish representational and source-materialization
 feasibility, not hosted authorization, workload isolation, or market demand.
 The tree-only source is connected to the runner; repositories that need
-submodules or `git archive` export attributes deliberately fall back. Hosted
-authorization still uses strict commit identity until the merge-queue sandbox
+submodules deliberately fall back.
+Hosted authorization still uses strict commit identity until the merge-queue sandbox
 proves that every execution input remains tree-equivalent. The remaining
 product questions are independent trust-domain execution, evidence lifecycle,
 producer conformance, and measurable avoided CI latency.
