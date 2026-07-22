@@ -54,3 +54,22 @@ Continue beyond a private shadow pilot only when:
 3. shadow runs show exact agreement with ordinary CI;
 4. key isolation, replay protection, fallback, and revocation work end to end;
 5. avoided latency or compute cost exceeds CIHash operating cost and adoption friction.
+
+## Continuation decision
+
+An adversarial architecture review concluded that a standalone vendor-operated
+trusted runner cannot win its own economics: it relocates the verification run
+to more expensive isolated infrastructure instead of eliminating it, and the
+eligibility constraints select for the cheapest CI jobs. The decisive
+constraint is ownership of the execution moment: only a system that already
+runs the agent's final verification can turn that run into evidence at zero
+marginal compute.
+
+Direction: position CIHash as an embedded attestation bridge for platforms
+that already execute a coding agent's final verification in an isolated
+workcell. The platform signs its existing run under its own key custody;
+CIHash supplies the receipt schema, the deterministic verifier, and the
+receipt-driven GitHub App with fallback orchestration. Vendor-operated
+execution at scale, generic GitHub Actions interpretation, and speculative
+compatibility layers are out of scope. The product gates above now test that
+wedge, and the pilot metrics that decide continuation are unchanged.

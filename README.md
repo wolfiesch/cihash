@@ -89,7 +89,7 @@ flowchart TD
     FB --> DONE["Fallback completes same App-owned check"]
 ```
 
-In **shadow mode**, rejected proof reuse produces a neutral diagnostic check and ordinary CI remains authoritative. In **enforcement mode**, rejection queues fallback and only the CIHash App publishes the final required-check conclusion.
+In **shadow mode**, rejected proof reuse produces a neutral diagnostic check and ordinary CI remains authoritative. In **enforcement mode**, rejection queues fallback and only the CIHash App publishes the final required-check conclusion. A proof verified after fallback was queued can still conclude the same check for the exact granted revisions, superseding the pending fallback's authority while its dispatched run finishes harmlessly.
 
 ## What has been demonstrated
 
@@ -217,6 +217,8 @@ flowchart TB
 - submodules and repositories whose execution depends on Git metadata;
 - a production runner mesh or multi-tenant control plane.
 
+The workflow digest binds the administrator-approved profile and command, not any GitHub Actions workflow definition; equivalence with a repository's ordinary CI gate is an administrator judgment. See the [threat model](docs/threat-model.md) for the full list of binding limits.
+
 The development runner shares a host kernel and Docker daemon with its supervisor. Production enforcement requires an ephemeral VM or hardened container host with the signer outside the workload host boundary.
 
 ## Project stage and next gate
@@ -238,6 +240,8 @@ flowchart LR
     style F fill:#57606a,color:#fff
     style G fill:#57606a,color:#fff
 ```
+
+The strategic direction, recorded in the [product brief](docs/product-brief.md), is an **embedded attestation bridge**: CIHash integrates into platforms that already execute a coding agent's final verification in an isolated workcell, because only the owner of that execution moment can turn it into evidence at zero marginal compute. CIHash supplies the receipt schema, the deterministic verifier, and the receipt-driven GitHub App; it does not operate a competing runner mesh.
 
 The next milestone is not another speculative compatibility layer. It is an economic shadow pilot across multiple external teams that measures:
 

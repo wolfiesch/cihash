@@ -6,6 +6,13 @@ CIHash owns the decision that converts a trusted pre-push run into an immediate 
 
 The product should reuse standard or existing execution and attestation components where they satisfy the trust contract.
 
+The decisive adoption constraint is ownership of the execution moment. Only a
+system that already runs the agent's final verification can turn that run into
+evidence at zero marginal compute; everyone else re-executes the workload on
+trusted infrastructure and competes with ordinary CI on cost. CIHash therefore
+integrates into agent execution platforms rather than operating a competing
+runner mesh.
+
 ## Adjacent systems
 
 | System | Existing strength | CIHash boundary |

@@ -32,6 +32,12 @@ digest commits to canonical JSON for the pinned image, Linux platform, disabled
 network, resource limits, and output bound. Every environment field is explicit;
 the producer cannot override one at execution time.
 
+The workflow digest binds the approved profile and command only. It does not
+bind any GitHub Actions workflow definition, its steps, or its permissions.
+CIHash proves that the approved command ran; whether that command is
+equivalent to a repository's ordinary CI gate is an administrator judgment
+that must be revisited whenever either side changes, not a verified claim.
+
 `maxAgeSeconds` is limited to 24 hours. `timeoutSeconds` is limited to two hours.
 The trusted runner enforces the timeout and signs only a bounded execution log.
 
@@ -95,9 +101,14 @@ In enforcement mode:
 - accepted proof: completed `success`;
 - rejected or missing proof: `queued` with fallback required;
 - the CIHash App dispatches or observes the approved fallback workflow for the same head and policy;
+- a proof verified after the queued check was created may conclude that same check as `success` for the exact granted revisions, superseding the pending fallback's authority;
 - only the CIHash App publishes the final required `cihash/verify` conclusion.
 
 No unsupported state is converted to success.
+
+A proven failure (`job_failed`, `proof_failed`) is diagnostic evidence only.
+Enforcement still dispatches fallback, so a failing change executes twice by
+design; proof reuse saves work only for eligible successful runs.
 
 ## Experimental GitHub-state applicability
 

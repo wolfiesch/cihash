@@ -63,3 +63,19 @@ boundary.
 ## Unsupported trust claims
 
 CIHash does not claim that passing tests make code secure, that a hash establishes trustworthy execution, or that signatures compensate for a compromised signer. It proves only the execution claim described by the accepted policy and receipt.
+
+Specific limits of the current bindings:
+
+- The workflow digest commits to the approved profile and command, not to any
+  GitHub Actions workflow definition. Equivalence between the approved command
+  and a repository's ordinary CI gate is an administrator judgment.
+- The environment digest commits to container-level claims: pinned image,
+  platform, disabled network, and resource limits. It does not bind the host
+  kernel, container runtime, or CPU microarchitecture.
+- Revocation, expiry, and key windows prevent future acceptance. They do not
+  retract a success check already attached to a head commit; recovery after a
+  key compromise that produced published checks is an operator procedure, not
+  a receipt-lifecycle property.
+- Exact-base safety at the merge boundary depends on the repository ruleset
+  requiring branches to be up to date. The signature cannot compensate for a
+  missing ruleset.
