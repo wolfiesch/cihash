@@ -1,0 +1,17 @@
+# Build output
+/cihash
+/dist/
+*.exe
+
+# Never commit trust material or generated evidence
+*.pem
+*.key
+receipts/
+runner-secrets/
+
+# Local state
+/state/
+*.log
+
+# Tooling
+.DS_Store

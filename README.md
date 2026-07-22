@@ -6,9 +6,11 @@
 
 CIHash is a proof-carrying CI prototype for coding-agent workflows. It turns an isolated, policy-approved pre-push run into a signed GitHub check decision without weakening the repository's existing CI safety net.
 
+[![CI](https://github.com/wolfiesch/cihash/actions/workflows/ci.yml/badge.svg)](https://github.com/wolfiesch/cihash/actions/workflows/ci.yml)
 ![Status: experimental](https://img.shields.io/badge/status-experimental-f59e0b)
 ![Go 1.25](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)
 ![Evidence: DSSE and in-toto](https://img.shields.io/badge/evidence-DSSE%20%2B%20in--toto-6366f1)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-3da639)](LICENSE)
 
 </div>
 
@@ -270,4 +272,4 @@ Please review the [threat model](docs/threat-model.md) before changing receipt f
 
 ## License
 
-No license file has been published yet. Until one is selected, treat this repository as an experimental evaluation artifact rather than a licensed open-source distribution.
+CIHash is licensed under the [Apache License, Version 2.0](LICENSE).
