@@ -24,6 +24,7 @@ type FallbackState struct {
 	InstallationID int64      `json:"installationId"`
 	CheckRunID     int64      `json:"checkRunId"`
 	WorkflowRunID  int64      `json:"workflowRunId,omitempty"`
+	Workflow       string     `json:"workflow"`
 	HeadSHA        string     `json:"headSha"`
 	BaseSHA        string     `json:"baseSha"`
 	BaseRef        string     `json:"baseRef"`
@@ -44,8 +45,8 @@ func (store StateStore) BeginDelivery(deliveryID string) (bool, error) {
 		return false, fmt.Errorf("GitHub delivery ID is required")
 	}
 	directory := filepath.Join(store.root, "deliveries")
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return false, fmt.Errorf("create delivery state directory: %w", err)
+	if err := ensureStateDirectory(directory); err != nil {
+		return false, err
 	}
 	key := digestName(deliveryID)
 	if _, err := os.Stat(filepath.Join(directory, key+".done")); err == nil {
@@ -67,6 +68,9 @@ func (store StateStore) BeginDelivery(deliveryID string) (bool, error) {
 			if err := os.Remove(inflightPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return false, fmt.Errorf("reclaim stale delivery: %w", err)
 			}
+			if err := syncStateDirectory(directory); err != nil {
+				return false, err
+			}
 			continue
 		}
 		if err != nil {
@@ -77,9 +81,17 @@ func (store StateStore) BeginDelivery(deliveryID string) (bool, error) {
 			_ = os.Remove(inflightPath)
 			return false, fmt.Errorf("record delivery: %w", err)
 		}
+		if err := file.Sync(); err != nil {
+			_ = file.Close()
+			_ = os.Remove(inflightPath)
+			return false, fmt.Errorf("sync delivery state: %w", err)
+		}
 		if err := file.Close(); err != nil {
 			_ = os.Remove(inflightPath)
 			return false, fmt.Errorf("close delivery state: %w", err)
+		}
+		if err := syncStateDirectory(directory); err != nil {
+			return false, err
 		}
 		return true, nil
 	}
@@ -91,7 +103,7 @@ func (store StateStore) CompleteDelivery(deliveryID string) error {
 	if err := os.Rename(filepath.Join(directory, key+".inflight"), filepath.Join(directory, key+".done")); err != nil {
 		return fmt.Errorf("complete delivery: %w", err)
 	}
-	return nil
+	return syncStateDirectory(directory)
 }
 
 func (store StateStore) FailDelivery(deliveryID string) {
@@ -99,12 +111,12 @@ func (store StateStore) FailDelivery(deliveryID string) {
 }
 
 func (store StateStore) CreateFallback(state FallbackState) error {
-	if state.ID == "" || state.CheckRunID <= 0 || state.InstallationID <= 0 || state.ExpiresAt.IsZero() {
+	if state.ID == "" || state.CheckRunID <= 0 || state.InstallationID <= 0 || state.Workflow == "" || state.ExpiresAt.IsZero() {
 		return fmt.Errorf("fallback state is incomplete")
 	}
 	directory := filepath.Join(store.root, "fallbacks")
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return fmt.Errorf("create fallback state directory: %w", err)
+	if err := ensureStateDirectory(directory); err != nil {
+		return err
 	}
 	path := filepath.Join(directory, digestName(state.ID)+".json")
 	if _, err := os.Stat(path); err == nil {
@@ -131,8 +143,8 @@ func (store StateStore) BindWorkflowRun(fallbackID string, workflowRunID int64) 
 		return err
 	}
 	indexDirectory := filepath.Join(store.root, "workflow-runs")
-	if err := os.MkdirAll(indexDirectory, 0o700); err != nil {
-		return fmt.Errorf("create workflow-run index: %w", err)
+	if err := ensureStateDirectory(indexDirectory); err != nil {
+		return err
 	}
 	return writeBytesAtomic(filepath.Join(indexDirectory, strconv.FormatInt(workflowRunID, 10)), []byte(fallbackID+"\n"), 0o600)
 }
@@ -147,6 +159,17 @@ func (store StateStore) LookupWorkflowRun(workflowRunID int64) (FallbackState, b
 		return FallbackState{}, false, fmt.Errorf("read workflow-run index: %w", err)
 	}
 	state, _, err := store.loadFallback(stringTrimSpace(fallbackID))
+	if err != nil {
+		return FallbackState{}, false, err
+	}
+	return state, true, nil
+}
+
+func (store StateStore) LookupFallback(fallbackID string) (FallbackState, bool, error) {
+	state, _, err := store.loadFallback(fallbackID)
+	if errors.Is(err, os.ErrNotExist) {
+		return FallbackState{}, false, nil
+	}
 	if err != nil {
 		return FallbackState{}, false, err
 	}
@@ -180,8 +203,8 @@ func (store StateStore) loadFallback(fallbackID string) (FallbackState, string, 
 	if err := json.Unmarshal(data, &state); err != nil {
 		return FallbackState{}, path, fmt.Errorf("decode fallback state: %w", err)
 	}
-	if state.ID != fallbackID {
-		return FallbackState{}, path, fmt.Errorf("fallback state identity mismatch")
+	if state.ID != fallbackID || state.CheckRunID <= 0 || state.InstallationID <= 0 || state.Workflow == "" || state.ExpiresAt.IsZero() {
+		return FallbackState{}, path, fmt.Errorf("fallback state identity or required fields are invalid")
 	}
 	return state, path, nil
 }
@@ -218,6 +241,25 @@ func writeBytesAtomic(path string, data []byte, mode os.FileMode) error {
 	}
 	if err := os.Rename(temporaryPath, path); err != nil {
 		return fmt.Errorf("replace state: %w", err)
+	}
+	return syncStateDirectory(filepath.Dir(path))
+}
+
+func ensureStateDirectory(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return fmt.Errorf("create state directory: %w", err)
+	}
+	return syncStateDirectory(filepath.Dir(path))
+}
+
+func syncStateDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open state directory for sync: %w", err)
+	}
+	defer directory.Close()
+	if err := directory.Sync(); err != nil {
+		return fmt.Errorf("sync state directory: %w", err)
 	}
 	return nil
 }

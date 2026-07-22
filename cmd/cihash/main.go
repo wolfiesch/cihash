@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/wolfiesch/cihash/internal/attestation"
+	"github.com/wolfiesch/cihash/internal/conformance"
 	"github.com/wolfiesch/cihash/internal/containerexec"
 	"github.com/wolfiesch/cihash/internal/githubapi"
 	"github.com/wolfiesch/cihash/internal/githubapp"
@@ -24,6 +26,7 @@ import (
 	"github.com/wolfiesch/cihash/internal/lab"
 	"github.com/wolfiesch/cihash/internal/policy"
 	"github.com/wolfiesch/cihash/internal/producer"
+	"github.com/wolfiesch/cihash/internal/remotesigner"
 	"github.com/wolfiesch/cihash/internal/rungrant"
 	"github.com/wolfiesch/cihash/internal/runner"
 	"github.com/wolfiesch/cihash/internal/shadow"
@@ -59,6 +62,8 @@ func execute(arguments []string, output io.Writer) *commandError {
 		return runCommand(arguments[1:], output)
 	case "hosted-run":
 		return hostedRunCommand(arguments[1:], output)
+	case "signer-serve":
+		return signerServeCommand(arguments[1:], output)
 	case "container-exec":
 		return containerExecCommand(arguments[1:], output)
 	case "verify":
@@ -216,13 +221,20 @@ func hostedRunCommand(arguments []string, output io.Writer) *commandError {
 	installationID := flags.Int64("installation", 0, "GitHub App installation ID")
 	pullRequestNumber := flags.Int64("pull-request", 0, "pull request number")
 	repositoryPath := flags.String("repo", ".", "path to the Git repository")
-	privateKeyPath := flags.String("private-key", "", "Ed25519 private key")
+	privateKeyPath := flags.String("private-key", "", "local Ed25519 private key")
+	signerURL := flags.String("signer", "", "remote signer base URL")
+	signerTokenPath := flags.String("signer-token-file", "", "remote signer bearer token file")
 	docker := flags.String("docker", "docker", "Docker-compatible CLI")
 	if err := flags.Parse(arguments); err != nil {
 		return usageError(err)
 	}
-	if *serverURL == "" || *tokenPath == "" || *installationID <= 0 || *pullRequestNumber <= 0 || *privateKeyPath == "" {
-		return usageError(errors.New("--server, --token-file, --installation, --pull-request, and --private-key are required"))
+	if *serverURL == "" || *tokenPath == "" || *installationID <= 0 || *pullRequestNumber <= 0 {
+		return usageError(errors.New("--server, --token-file, --installation, and --pull-request are required"))
+	}
+	localSigning := *privateKeyPath != ""
+	remoteSigning := *signerURL != "" || *signerTokenPath != ""
+	if localSigning == remoteSigning || (remoteSigning && (*signerURL == "" || *signerTokenPath == "")) {
+		return usageError(errors.New("use exactly one of --private-key or --signer with --signer-token-file"))
 	}
 	token, err := os.ReadFile(*tokenPath)
 	if err != nil {
@@ -232,9 +244,25 @@ func hostedRunCommand(arguments []string, output io.Writer) *commandError {
 	if err != nil {
 		return operationalError(err)
 	}
-	privateKey, err := attestation.LoadPrivateKey(*privateKeyPath)
-	if err != nil {
-		return operationalError(err)
+	var signResult func(context.Context, rungrant.Grant, attestation.TestResult) (attestation.Envelope, error)
+	if localSigning {
+		privateKey, err := attestation.LoadPrivateKey(*privateKeyPath)
+		if err != nil {
+			return operationalError(err)
+		}
+		signResult = func(_ context.Context, _ rungrant.Grant, result attestation.TestResult) (attestation.Envelope, error) {
+			return attestation.Sign(attestation.NewStatement(result), privateKey)
+		}
+	} else {
+		signerToken, err := os.ReadFile(*signerTokenPath)
+		if err != nil {
+			return operationalError(fmt.Errorf("read signer token: %w", err))
+		}
+		signerClient, err := remotesigner.New(*signerURL, signerToken, &http.Client{Timeout: 30 * time.Second})
+		if err != nil {
+			return operationalError(err)
+		}
+		signResult = signerClient.Sign
 	}
 	runContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -250,7 +278,7 @@ func hostedRunCommand(arguments []string, output io.Writer) *commandError {
 	if err != nil {
 		return operationalError(err)
 	}
-	envelope, err := attestation.Sign(attestation.NewStatement(outcome.Result), privateKey)
+	envelope, err := signResult(runContext, grant, outcome.Result)
 	if err != nil {
 		return operationalError(err)
 	}
@@ -273,6 +301,86 @@ func hostedRunCommand(arguments []string, output io.Writer) *commandError {
 		return &commandError{code: 1, err: errors.New("verification command failed; signed failure receipt submitted")}
 	}
 	return nil
+}
+
+func signerServeCommand(arguments []string, output io.Writer) *commandError {
+	flags := flag.NewFlagSet("signer-serve", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	listen := flags.String("listen", "127.0.0.1:18082", "signer listen address")
+	privateKeyPath := flags.String("private-key", "", "Ed25519 private key")
+	tokenPath := flags.String("token-file", "", "supervisor bearer token file")
+	tlsCertificatePath := flags.String("tls-cert", "", "TLS certificate file")
+	tlsKeyPath := flags.String("tls-key", "", "TLS private key file")
+	checkConfig := flags.Bool("check-config", false, "validate signer configuration without listening")
+	if err := flags.Parse(arguments); err != nil {
+		return usageError(err)
+	}
+	if *privateKeyPath == "" || *tokenPath == "" {
+		return usageError(errors.New("--private-key and --token-file are required"))
+	}
+	tlsEnabled := *tlsCertificatePath != "" || *tlsKeyPath != ""
+	if tlsEnabled && (*tlsCertificatePath == "" || *tlsKeyPath == "") {
+		return usageError(errors.New("--tls-cert and --tls-key must be used together"))
+	}
+	if tlsEnabled {
+		if _, err := tls.LoadX509KeyPair(*tlsCertificatePath, *tlsKeyPath); err != nil {
+			return operationalError(fmt.Errorf("load signer TLS key pair: %w", err))
+		}
+	}
+	privateKey, err := attestation.LoadPrivateKey(*privateKeyPath)
+	if err != nil {
+		return operationalError(err)
+	}
+	token, err := os.ReadFile(*tokenPath)
+	if err != nil {
+		return operationalError(fmt.Errorf("read signer token: %w", err))
+	}
+	signerServer, err := remotesigner.NewServer(token, privateKey)
+	if err != nil {
+		return operationalError(err)
+	}
+	if *checkConfig {
+		return writeJSON(output, map[string]any{"listen": *listen, "tls": tlsEnabled, "valid": true})
+	}
+	listener, err := net.Listen("tcp", *listen)
+	if err != nil {
+		return operationalError(fmt.Errorf("listen on %s: %w", *listen, err))
+	}
+	httpServer := &http.Server{
+		Handler:           signerServer.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := writeJSON(output, map[string]any{"listen": listener.Addr().String()}); err != nil {
+		_ = listener.Close()
+		return err
+	}
+	signalContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	serverError := make(chan error, 1)
+	go func() {
+		if tlsEnabled {
+			serverError <- httpServer.ServeTLS(listener, *tlsCertificatePath, *tlsKeyPath)
+			return
+		}
+		serverError <- httpServer.Serve(listener)
+	}()
+	select {
+	case err := <-serverError:
+		if !errors.Is(err, http.ErrServerClosed) {
+			return operationalError(err)
+		}
+		return nil
+	case <-signalContext.Done():
+		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownContext); err != nil {
+			return operationalError(fmt.Errorf("shut down signer service: %w", err))
+		}
+		return nil
+	}
 }
 
 func verifyCommand(arguments []string, output io.Writer) *commandError {
@@ -505,12 +613,28 @@ func serveCommand(arguments []string, output io.Writer) *commandError {
 }
 
 func labCommand(arguments []string, output io.Writer) *commandError {
-	const usage = "usage: cihash lab <trust-quorum|applicability|confirmer|tree-isolation|shadow-report>"
+	const usage = "usage: cihash lab <trust-quorum|applicability|confirmer|tree-isolation|tree-reuse|job-set|producer-conformance|shadow-report>"
 	if len(arguments) > 0 && arguments[0] == "shadow-report" {
 		return shadowReportCommand(arguments[1:], output)
 	}
+	if len(arguments) > 1 && arguments[0] == "producer-conformance" {
+		return producerConformanceCommand(arguments[1:], output)
+	}
 	if len(arguments) != 1 {
 		return usageError(errors.New(usage))
+	}
+	if arguments[0] == "producer-conformance" {
+		report, err := lab.RunProducerConformance()
+		if err != nil {
+			return operationalError(err)
+		}
+		if err := writeJSON(output, report); err != nil {
+			return err
+		}
+		if !report.Passed {
+			return operationalError(errors.New("producer-conformance experiment did not satisfy expected decisions"))
+		}
+		return nil
 	}
 
 	var (
@@ -526,6 +650,10 @@ func labCommand(arguments []string, output io.Writer) *commandError {
 		report, err = lab.RunConfirmer()
 	case "tree-isolation":
 		report, err = lab.RunTreeIsolation()
+	case "tree-reuse":
+		report, err = lab.RunTreeReuse()
+	case "job-set":
+		report, err = lab.RunJobSet()
 	default:
 		return usageError(errors.New(usage))
 	}
@@ -537,6 +665,44 @@ func labCommand(arguments []string, output io.Writer) *commandError {
 	}
 	if !report.Passed {
 		return operationalError(fmt.Errorf("%s experiment did not satisfy expected decisions", arguments[0]))
+	}
+	return nil
+}
+
+func producerConformanceCommand(arguments []string, output io.Writer) *commandError {
+	flags := flag.NewFlagSet("producer-conformance", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	grantPath := flags.String("grant", "", "server-issued run grant JSON")
+	resultPath := flags.String("result", "", "normalized unsigned test result JSON")
+	nowValue := flags.String("now", "", "evaluation time in RFC3339 format")
+	if err := flags.Parse(arguments); err != nil {
+		return usageError(err)
+	}
+	if *grantPath == "" || *resultPath == "" {
+		return usageError(errors.New("--grant and --result are required"))
+	}
+	var grant rungrant.Grant
+	if err := conformance.Load(*grantPath, &grant); err != nil {
+		return operationalError(err)
+	}
+	var result attestation.TestResult
+	if err := conformance.Load(*resultPath, &result); err != nil {
+		return operationalError(err)
+	}
+	var now time.Time
+	if *nowValue != "" {
+		parsed, err := time.Parse(time.RFC3339, *nowValue)
+		if err != nil {
+			return usageError(fmt.Errorf("--now must use RFC3339: %w", err))
+		}
+		now = parsed
+	}
+	report := conformance.Check(grant, result, now)
+	if err := writeJSON(output, report); err != nil {
+		return err
+	}
+	if !report.Conformant {
+		return operationalError(errors.New("producer result is not conformant"))
 	}
 	return nil
 }
@@ -590,5 +756,5 @@ func operationalError(err error) *commandError {
 }
 
 func printUsage(output io.Writer) {
-	fmt.Fprintln(output, "usage: cihash <keygen|policy|run|hosted-run|container-exec|verify|check|serve|lab|version> [options]")
+	fmt.Fprintln(output, "usage: cihash <keygen|policy|run|hosted-run|signer-serve|container-exec|verify|check|serve|lab|version> [options]")
 }

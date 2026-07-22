@@ -109,9 +109,10 @@ the hosted decision path:
 - `merge_tree` explores reuse after a base or context change only when the
   repository, tested tree, policy, workflow, and environment remain exact.
 
-`merge_tree` is not safe for the current runner. The workload runs inside a Git
-clone and can observe commit, base, and merge metadata, so equal tree hashes do
-not establish equivalent execution inputs. A future tree-equivalent policy
-requires an administrator-approved tree-only execution mode that excludes
-repository metadata from the workload. Until that boundary exists and is
-measured, moved bases and merge-group changes continue to fail closed.
+The runner now materializes only the tested tree and excludes Git metadata,
+refs, hooks, remotes, and untracked host files from the workload. That boundary
+is necessary but not sufficient for hosted `merge_tree` acceptance: the policy
+must also make commit identity unavailable through environment variables and
+other execution inputs, and the GitHub App must bind the current context to the
+same independently resolved tree. Until those conditions are exercised in the
+hosted sandbox, moved bases and merge-group changes continue to fail closed.

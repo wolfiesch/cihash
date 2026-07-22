@@ -156,6 +156,7 @@ func TestMissingProofDispatchesAndCompletesFallback(t *testing.T) {
 		"installation": map[string]any{"id": 123},
 		"workflow_run": map[string]any{
 			"id":          99,
+			"path":        ".github/workflows/cihash-fallback.yml",
 			"event":       "workflow_dispatch",
 			"status":      "completed",
 			"conclusion":  "success",
@@ -180,6 +181,115 @@ func TestMissingProofDispatchesAndCompletesFallback(t *testing.T) {
 		t.Fatalf("completed state = %+v, %v, %v", state, found, err)
 	}
 }
+func TestWorkflowRunRejectsSpoofedFallbackWorkflow(t *testing.T) {
+	for _, workflowPath := range []string{"", ".github/workflows/attacker.yml"} {
+		t.Run(workflowPath, func(t *testing.T) {
+			server, client, secret, headSHA, baseSHA := hostedFixture(t, githubapp.EnforceMode, false)
+			if response := sendWebhook(t, server, secret, "pull_request", "delivery-fallback", pullRequestBody(headSHA, baseSHA)); response.Code != http.StatusAccepted {
+				t.Fatalf("pull request status = %d, body = %s", response.Code, response.Body.String())
+			}
+			workflowBody := map[string]any{
+				"action":       "completed",
+				"repository":   map[string]any{"full_name": "owner/project"},
+				"installation": map[string]any{"id": 123},
+				"workflow_run": map[string]any{
+					"id":          99,
+					"path":        workflowPath,
+					"event":       "workflow_dispatch",
+					"status":      "completed",
+					"conclusion":  "success",
+					"head_branch": "main",
+					"head_sha":    baseSHA,
+					"updated_at":  server.now().Add(time.Minute),
+				},
+			}
+			response := sendWebhook(t, server, secret, "workflow_run", "delivery-workflow", workflowBody)
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+			}
+			if len(client.updatedChecks) != 0 {
+				t.Fatalf("updated checks = %d, want 0", len(client.updatedChecks))
+			}
+		})
+	}
+}
+func TestMatchesFallbackWorkflowByFileOrNumericID(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		configured string
+		workflowID int64
+		path       string
+		want       bool
+	}{
+		{name: "file match", configured: "cihash-fallback.yml", path: ".github/workflows/cihash-fallback.yml", want: true},
+		{name: "file mismatch", configured: "cihash-fallback.yml", path: ".github/workflows/other.yml"},
+		{name: "numeric match", configured: "12345", workflowID: 12345, path: ".github/workflows/other.yml", want: true},
+		{name: "numeric mismatch", configured: "12345", workflowID: 54321, path: ".github/workflows/cihash-fallback.yml"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := matchesFallbackWorkflow(test.configured, test.workflowID, test.path); got != test.want {
+				t.Fatalf("matchesFallbackWorkflow(%q, %d, %q) = %t, want %t", test.configured, test.workflowID, test.path, got, test.want)
+			}
+		})
+	}
+}
+
+func TestWorkflowRunRecoversFallbackBindingAfterCrash(t *testing.T) {
+	server, client, secret, headSHA, baseSHA := hostedFixture(t, githubapp.EnforceMode, false)
+	fallbackID, err := randomID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyDigest, err := server.policy.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := FallbackState{
+		ID:             fallbackID,
+		Repository:     "owner/project",
+		InstallationID: 123,
+		CheckRunID:     314,
+		Workflow:       "cihash-fallback.yml",
+		HeadSHA:        headSHA,
+		BaseSHA:        baseSHA,
+		BaseRef:        "main",
+		PolicyDigest:   policyDigest,
+		ExternalID:     "cihash-recovery",
+		CreatedAt:      server.now(),
+		ExpiresAt:      server.now().Add(2 * time.Hour),
+	}
+	if err := server.stateStore.CreateFallback(state); err != nil {
+		t.Fatal(err)
+	}
+	workflowBody := map[string]any{
+		"action":       "completed",
+		"repository":   map[string]any{"full_name": state.Repository},
+		"installation": map[string]any{"id": state.InstallationID},
+		"workflow_run": map[string]any{
+			"id":            2718,
+			"path":          ".github/workflows/cihash-fallback.yml",
+			"event":         "workflow_dispatch",
+			"status":        "completed",
+			"conclusion":    "success",
+			"head_branch":   state.BaseRef,
+			"head_sha":      state.BaseSHA,
+			"display_title": "cihash-" + fallbackID + "-" + state.HeadSHA + "-" + state.BaseSHA,
+			"updated_at":    server.now().Add(time.Minute),
+		},
+	}
+	response := sendWebhook(t, server, secret, "workflow_run", "delivery-recovered-workflow", workflowBody)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if len(client.updatedChecks) != 1 || client.updatedChecks[0].checkRunID != state.CheckRunID || client.updatedChecks[0].Conclusion != "success" {
+		t.Fatalf("updated checks = %+v, want recovered success", client.updatedChecks)
+	}
+	recovered, found, err := server.stateStore.LookupWorkflowRun(2718)
+	if err != nil || !found || recovered.CompletedAt == nil || recovered.Conclusion != "success" {
+		t.Fatalf("recovered state = %+v, %v, %v", recovered, found, err)
+	}
+}
+
 func TestFallbackDispatchFailureKeepsConfiguredCheckName(t *testing.T) {
 	server, client, secret, headSHA, baseSHA := hostedFixture(t, githubapp.EnforceMode, false)
 	client.dispatchErr = io.ErrClosedPipe

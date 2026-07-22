@@ -27,10 +27,12 @@ func ExpectedFromPolicy(configured policy.Policy, head, base, nonce string, now 
 		WorkflowDigest:    workflowDigest,
 		EnvironmentDigest: configured.EnvironmentDigest(),
 		Architecture:      configured.Environment.Platform,
-		Command:           append([]string(nil), configured.Command...),
-		RequiredJobs:      []string{configured.Profile},
-		Nonce:             nonce,
-		MaxAge:            time.Duration(configured.MaxAgeSeconds) * time.Second,
-		Now:               now.UTC(),
+		Jobs: []ExpectedJob{{
+			Name:    configured.Profile,
+			Command: append([]string(nil), configured.Command...),
+		}},
+		Nonce:  nonce,
+		MaxAge: time.Duration(configured.MaxAgeSeconds) * time.Second,
+		Now:    now.UTC(),
 	}, nil
 }

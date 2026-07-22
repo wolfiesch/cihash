@@ -15,7 +15,7 @@ import (
 	"log"
 	"mime"
 	"net/http"
-	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,10 +30,11 @@ import (
 )
 
 const (
-	maxWebhookBody = 1 << 20
-	maxReceiptBody = 8 << 20
-	maxReceiptLog  = 4 << 20
-	runsEndpoint   = "/api/v1/runs"
+	maxWebhookBody  = 1 << 20
+	maxReceiptBody  = 8 << 20
+	maxReceiptLog   = 4 << 20
+	fallbackIDBytes = 24
+	runsEndpoint    = "/api/v1/runs"
 )
 
 type GitHubClient interface {
@@ -93,6 +94,9 @@ type workflowRunPayload struct {
 		HeadBranch   string    `json:"head_branch"`
 		HeadSHA      string    `json:"head_sha"`
 		Name         string    `json:"name"`
+		WorkflowID   int64     `json:"workflow_id"`
+		Path         string    `json:"path"`
+		DisplayTitle string    `json:"display_title"`
 		RunStartedAt time.Time `json:"run_started_at"`
 		UpdatedAt    time.Time `json:"updated_at"`
 		PullRequests []struct {
@@ -141,8 +145,8 @@ func NewServer(config Config, webhookSecret, producerToken []byte, configuredPol
 	if logger == nil {
 		logger = log.Default()
 	}
-	if err := os.MkdirAll(config.StateDirectory, 0o700); err != nil {
-		return nil, fmt.Errorf("create hosted state directory: %w", err)
+	if err := ensureStateDirectory(config.StateDirectory); err != nil {
+		return nil, err
 	}
 	build, err := inspectServiceBuild()
 	if err != nil {
@@ -304,13 +308,15 @@ func (server *Server) handleReceipt(response http.ResponseWriter, request *http.
 		WorkflowDigest:    record.Grant.WorkflowDigest,
 		EnvironmentDigest: record.Grant.EnvironmentDigest,
 		Architecture:      record.Grant.Architecture,
-		Command:           append([]string(nil), record.Grant.Policy.Command...),
-		RequiredJobs:      []string{record.Grant.Policy.Profile},
-		Nonce:             record.Grant.Nonce,
-		MaxAge:            record.Grant.ExpiresAt.Sub(record.Grant.IssuedAt),
-		NotBefore:         record.Grant.IssuedAt,
-		ExpiresAt:         record.Grant.ExpiresAt,
-		Now:               now,
+		Jobs: []verifier.ExpectedJob{{
+			Name:    record.Grant.Policy.Profile,
+			Command: append([]string(nil), record.Grant.Policy.Command...),
+		}},
+		Nonce:     record.Grant.Nonce,
+		MaxAge:    record.Grant.ExpiresAt.Sub(record.Grant.IssuedAt),
+		NotBefore: record.Grant.IssuedAt,
+		ExpiresAt: record.Grant.ExpiresAt,
+		Now:       now,
 	}
 	decision := verifier.Verify(submission.Envelope, server.publicKey, expected)
 	if !decision.Accepted && decision.Code != "job_failed" && decision.Code != "proof_failed" {
@@ -611,13 +617,15 @@ func expectedFromGrant(grant rungrant.Grant, treeSHA string, now time.Time) veri
 		WorkflowDigest:    grant.WorkflowDigest,
 		EnvironmentDigest: grant.EnvironmentDigest,
 		Architecture:      grant.Architecture,
-		Command:           append([]string(nil), grant.Policy.Command...),
-		RequiredJobs:      []string{grant.Policy.Profile},
-		Nonce:             grant.Nonce,
-		MaxAge:            grant.ExpiresAt.Sub(grant.IssuedAt),
-		NotBefore:         grant.IssuedAt,
-		ExpiresAt:         grant.ExpiresAt,
-		Now:               now,
+		Jobs: []verifier.ExpectedJob{{
+			Name:    grant.Policy.Profile,
+			Command: append([]string(nil), grant.Policy.Command...),
+		}},
+		Nonce:     grant.Nonce,
+		MaxAge:    grant.ExpiresAt.Sub(grant.IssuedAt),
+		NotBefore: grant.IssuedAt,
+		ExpiresAt: grant.ExpiresAt,
+		Now:       now,
 	}
 }
 
@@ -637,6 +645,7 @@ func (server *Server) dispatchFallback(ctx context.Context, token string, payloa
 		InstallationID: payload.Installation.ID,
 		CheckRunID:     checkRunID,
 		HeadSHA:        payload.PullRequest.Head.SHA,
+		Workflow:       server.config.FallbackWorkflow,
 		BaseSHA:        payload.PullRequest.Base.SHA,
 		BaseRef:        payload.PullRequest.Base.Ref,
 		PolicyDigest:   policyDigest,
@@ -753,10 +762,32 @@ func (server *Server) handleWorkflowRun(ctx context.Context, body []byte) error 
 	if err != nil {
 		return err
 	}
-	if !found || state.CompletedAt != nil {
+	if !found {
+		fallbackID, titleHeadSHA, titleBaseSHA, ok := fallbackRunIdentity(payload.WorkflowRun.DisplayTitle)
+		if !ok {
+			return nil
+		}
+		state, found, err = server.stateStore.LookupFallback(fallbackID)
+		if err != nil {
+			return err
+		}
+		if !found || state.CompletedAt != nil {
+			return nil
+		}
+		if titleHeadSHA != state.HeadSHA || titleBaseSHA != state.BaseSHA ||
+			payload.Repository.FullName != state.Repository || payload.Installation.ID != state.InstallationID ||
+			!matchesFallbackWorkflow(state.Workflow, payload.WorkflowRun.WorkflowID, payload.WorkflowRun.Path) {
+			return fmt.Errorf("workflow_run identity does not match pending fallback")
+		}
+		if err := server.stateStore.BindWorkflowRun(fallbackID, payload.WorkflowRun.ID); err != nil {
+			return err
+		}
+	}
+	if state.CompletedAt != nil {
 		return nil
 	}
-	if payload.Repository.FullName != state.Repository || payload.Installation.ID != state.InstallationID {
+	if payload.Repository.FullName != state.Repository || payload.Installation.ID != state.InstallationID ||
+		!matchesFallbackWorkflow(state.Workflow, payload.WorkflowRun.WorkflowID, payload.WorkflowRun.Path) {
 		return fmt.Errorf("workflow_run identity does not match pending fallback")
 	}
 	conclusion, title, summary := fallbackConclusion(payload, state, server.now())
@@ -783,6 +814,46 @@ func (server *Server) handleWorkflowRun(ctx context.Context, body []byte) error 
 		return err
 	}
 	return server.stateStore.CompleteFallback(state.ID, conclusion, completedAt)
+}
+
+func fallbackRunIdentity(displayTitle string) (string, string, string, bool) {
+	const prefix = "cihash-"
+	if !strings.HasPrefix(displayTitle, prefix) {
+		return "", "", "", false
+	}
+	value := strings.TrimPrefix(displayTitle, prefix)
+	baseSeparator := strings.LastIndexByte(value, '-')
+	if baseSeparator < 1 {
+		return "", "", "", false
+	}
+	baseSHA := value[baseSeparator+1:]
+	value = value[:baseSeparator]
+	headSeparator := strings.LastIndexByte(value, '-')
+	if headSeparator < 1 {
+		return "", "", "", false
+	}
+	fallbackID := value[:headSeparator]
+	headSHA := value[headSeparator+1:]
+	decodedID, err := base64.RawURLEncoding.DecodeString(fallbackID)
+	if err != nil || len(decodedID) != fallbackIDBytes || !validWorkflowObjectID(headSHA) || !validWorkflowObjectID(baseSHA) || len(headSHA) != len(baseSHA) {
+		return "", "", "", false
+	}
+	return fallbackID, headSHA, baseSHA, true
+}
+
+func validWorkflowObjectID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func matchesFallbackWorkflow(configured string, workflowID int64, workflowPath string) bool {
+	if numericID, err := strconv.ParseInt(configured, 10, 64); err == nil {
+		return numericID > 0 && workflowID == numericID
+	}
+	return workflowPath == ".github/workflows/"+configured
 }
 
 func fallbackConclusion(payload workflowRunPayload, state FallbackState, now time.Time) (string, string, string) {
@@ -831,7 +902,7 @@ func verifyWebhookSignature(secret, body []byte, header string) bool {
 }
 
 func randomID() (string, error) {
-	value := make([]byte, 24)
+	value := make([]byte, fallbackIDBytes)
 	if _, err := rand.Read(value); err != nil {
 		return "", fmt.Errorf("generate fallback ID: %w", err)
 	}

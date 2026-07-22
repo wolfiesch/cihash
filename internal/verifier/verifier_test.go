@@ -77,6 +77,24 @@ func TestVerifyRejectsSignedFailure(t *testing.T) {
 		t.Fatalf("decision = %+v, want job_failed", decision)
 	}
 }
+func TestVerifyRejectsContradictoryAggregateConclusion(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		jobConclusion     string
+		overallConclusion string
+	}{
+		{name: "failed job successful run", jobConclusion: "failure", overallConclusion: "success"},
+		{name: "successful job failed run", jobConclusion: "success", overallConclusion: "failure"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			envelope, publicKey, expected := signedConclusionsFixture(t, test.jobConclusion, test.overallConclusion)
+			decision := Verify(envelope, publicKey, expected)
+			if decision.Accepted || decision.Code != "malformed_receipt" {
+				t.Fatalf("decision = %+v, want malformed_receipt", decision)
+			}
+		})
+	}
+}
 
 func TestVerifyRejectsExpiredProof(t *testing.T) {
 	envelope, publicKey, expected := signedFixture(t, "success")
@@ -89,13 +107,18 @@ func TestVerifyRejectsExpiredProof(t *testing.T) {
 
 func signedFixture(t *testing.T, conclusion string) (attestation.Envelope, ed25519.PublicKey, Expected) {
 	t.Helper()
+	return signedConclusionsFixture(t, conclusion, conclusion)
+}
+
+func signedConclusionsFixture(t *testing.T, jobConclusion, overallConclusion string) (attestation.Envelope, ed25519.PublicKey, Expected) {
+	t.Helper()
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)
 	exitCode := 0
-	if conclusion != "success" {
+	if jobConclusion != "success" {
 		exitCode = 1
 	}
 	command := []string{"go", "test", "./..."}
@@ -114,12 +137,12 @@ func signedFixture(t *testing.T, conclusion string) (attestation.Envelope, ed255
 			Name:        "verify",
 			Command:     command,
 			ExitCode:    exitCode,
-			Conclusion:  conclusion,
+			Conclusion:  jobConclusion,
 			StartedAt:   now.Add(-time.Minute),
 			CompletedAt: now.Add(-time.Second),
 			LogDigest:   attestation.Digest([]byte("log")),
 		}},
-		Conclusion: conclusion,
+		Conclusion: overallConclusion,
 		Nonce:      "expected-nonce",
 		IssuedAt:   now,
 		ExpiresAt:  now.Add(time.Hour),
@@ -138,8 +161,7 @@ func signedFixture(t *testing.T, conclusion string) (attestation.Envelope, ed255
 		WorkflowDigest:    result.WorkflowDigest,
 		EnvironmentDigest: result.EnvironmentDigest,
 		Architecture:      result.Architecture,
-		Command:           command,
-		RequiredJobs:      []string{"verify"},
+		Jobs:              []ExpectedJob{{Name: "verify", Command: command}},
 		Nonce:             result.Nonce,
 		MaxAge:            time.Hour,
 		Now:               now,

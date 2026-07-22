@@ -59,8 +59,9 @@ required check:
 
 These experiments establish representational and source-materialization
 feasibility, not hosted authorization, workload isolation, or market demand.
-The tree-only source is not yet connected to the runner, and repositories that
-need submodules or `git archive` export attributes deliberately fall back. The
-remaining product questions are independent trust-domain execution, immutable
-GitHub-state resolution, evidence lifecycle, producer conformance, and
-measurable avoided CI latency.
+The tree-only source is connected to the runner; repositories that need
+submodules or `git archive` export attributes deliberately fall back. Hosted
+authorization still uses strict commit identity until the merge-queue sandbox
+proves that every execution input remains tree-equivalent. The remaining
+product questions are independent trust-domain execution, evidence lifecycle,
+producer conformance, and measurable avoided CI latency.

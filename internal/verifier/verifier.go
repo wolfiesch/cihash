@@ -11,6 +11,11 @@ import (
 	"github.com/wolfiesch/cihash/internal/attestation"
 )
 
+type ExpectedJob struct {
+	Name    string
+	Command []string
+}
+
 type Expected struct {
 	Repository        string
 	HeadSHA           string
@@ -21,8 +26,7 @@ type Expected struct {
 	WorkflowDigest    string
 	EnvironmentDigest string
 	Architecture      string
-	Command           []string
-	RequiredJobs      []string
+	Jobs              []ExpectedJob
 	Nonce             string
 	MaxAge            time.Duration
 	Now               time.Time
@@ -45,6 +49,13 @@ func Verify(envelope attestation.Envelope, publicKey ed25519.PublicKey, expected
 		return signatureDecision(err)
 	}
 	return verifyStatement(statement, expected)
+}
+
+// ValidateUnsignedResult checks result shape and grant-bound identity without
+// authenticating a signer. It is suitable for producer conformance checks only;
+// callers MUST NOT use it to authorize a check.
+func ValidateUnsignedResult(result attestation.TestResult, expected Expected) Decision {
+	return verifyStatement(attestation.NewStatement(result), expected)
 }
 
 func VerifyThreshold(envelope attestation.Envelope, publicKeys []ed25519.PublicKey, threshold int, expected Expected) Decision {
@@ -147,19 +158,31 @@ func validateStatement(statement attestation.Statement, expected Expected) Decis
 		return reject("expired", "proof validity exceeds the approved maximum age")
 	}
 
-	if len(predicate.Jobs) != len(expected.RequiredJobs) {
+	if len(predicate.Jobs) != len(expected.Jobs) {
 		return reject("job_set_mismatch", "proof does not contain the complete required job set")
 	}
+	required := make(map[string][]string, len(expected.Jobs))
+	for _, job := range expected.Jobs {
+		if job.Name == "" {
+			return reject("job_set_mismatch", "required job set contains an empty name")
+		}
+		if _, duplicate := required[job.Name]; duplicate {
+			return reject("job_set_mismatch", "required job set contains a duplicate job")
+		}
+		required[job.Name] = job.Command
+	}
 	seen := make(map[string]struct{}, len(predicate.Jobs))
+	failedJobName := ""
 	for _, job := range predicate.Jobs {
 		if _, duplicate := seen[job.Name]; duplicate {
 			return reject("job_set_mismatch", "proof contains a duplicate job")
 		}
 		seen[job.Name] = struct{}{}
-		if !slices.Contains(expected.RequiredJobs, job.Name) {
+		requiredCommand, approved := required[job.Name]
+		if !approved {
 			return reject("job_set_mismatch", "proof contains an unapproved job")
 		}
-		if !slices.Equal(job.Command, expected.Command) {
+		if !slices.Equal(job.Command, requiredCommand) {
 			return reject("workflow_mismatch", "proof job command does not match the approved command")
 		}
 		if err := attestation.ValidateDigest(job.LogDigest); err != nil {
@@ -170,12 +193,28 @@ func validateStatement(statement attestation.Statement, expected Expected) Decis
 			job.CompletedAt.After(predicate.IssuedAt.Add(skew)) {
 			return reject("malformed_receipt", "proof contains invalid job timestamps")
 		}
-		if job.Conclusion != "success" || job.ExitCode != 0 {
-			return reject("job_failed", fmt.Sprintf("required job %q did not succeed", job.Name))
+		switch {
+		case job.Conclusion == "success" && job.ExitCode == 0:
+		case job.Conclusion == "failure" && job.ExitCode != 0:
+			if failedJobName == "" {
+				failedJobName = job.Name
+			}
+		default:
+			return reject("malformed_receipt", fmt.Sprintf("required job %q has inconsistent conclusion and exit code", job.Name))
 		}
 	}
-	if predicate.Conclusion != "success" {
-		return reject("proof_failed", "proof records an unsuccessful run")
+	switch predicate.Conclusion {
+	case "success":
+		if failedJobName != "" {
+			return reject("malformed_receipt", "proof success contradicts a failed required job")
+		}
+	case "failure":
+		if failedJobName == "" {
+			return reject("malformed_receipt", "proof failure contradicts successful required jobs")
+		}
+		return reject("job_failed", fmt.Sprintf("required job %q did not succeed", failedJobName))
+	default:
+		return reject("malformed_receipt", "proof contains an unsupported conclusion")
 	}
 	return Decision{Accepted: true, Statement: statement}
 }

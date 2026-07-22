@@ -119,6 +119,34 @@ func TestStoreEnforcesRunLifecycle(t *testing.T) {
 	}
 }
 
+func TestStoreRecoversEachPersistedLifecycleTransition(t *testing.T) {
+	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
+	grant := testGrant(t, now)
+	root := t.TempDir()
+	if _, err := NewStore(root).Create(grant); err != nil {
+		t.Fatal(err)
+	}
+	issued, found, err := NewStore(root).Lookup(grant.ID, now.Add(time.Second))
+	if err != nil || !found || issued.Status != StatusIssued {
+		t.Fatalf("issued after restart = %+v, %v, %v", issued, found, err)
+	}
+	receiptDigest := attestation.Digest([]byte("receipt"))
+	if _, err := NewStore(root).MarkSubmitted(grant.ID, receiptDigest, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	submitted, found, err := NewStore(root).Lookup(grant.ID, now.Add(2*time.Minute))
+	if err != nil || !found || submitted.Status != StatusSubmitted || submitted.ReceiptDigest != receiptDigest {
+		t.Fatalf("submitted after restart = %+v, %v, %v", submitted, found, err)
+	}
+	if _, err := NewStore(root).MarkConsumed(grant.ID, now.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	consumed, found, err := NewStore(root).Lookup(grant.ID, now.Add(4*time.Minute))
+	if err != nil || !found || consumed.Status != StatusConsumed {
+		t.Fatalf("consumed after restart = %+v, %v, %v", consumed, found, err)
+	}
+}
+
 func TestStoreRejectsExpiredOrConflictingSubmission(t *testing.T) {
 	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
 	grant := testGrant(t, now)
