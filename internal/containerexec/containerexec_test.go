@@ -47,8 +47,8 @@ func TestDockerArgumentsConstrainWorkload(t *testing.T) {
 		}
 	}
 	joined := strings.Join(arguments, " ")
-	if !strings.Contains(joined, "--tmpfs /work:rw,nosuid,nodev,size=8g") {
-		t.Fatalf("arguments do not provide a writable bounded work tmpfs: %v", arguments)
+	if !strings.Contains(joined, "--tmpfs /work:rw,exec,nosuid,nodev,size=8g") {
+		t.Fatalf("arguments do not provide an executable, writable, bounded work tmpfs: %v", arguments)
 	}
 	for _, forbidden := range []string{"--privileged", "docker.sock", "CIHASH_GITHUB", "PRIVATE_KEY", "WEBHOOK_SECRET"} {
 		if strings.Contains(joined, forbidden) {
