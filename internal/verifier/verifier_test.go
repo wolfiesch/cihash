@@ -61,6 +61,24 @@ func TestVerifyRejectsChangedTree(t *testing.T) {
 	}
 }
 
+func TestVerifyRejectsChangedWorkflowDigest(t *testing.T) {
+	envelope, publicKey, expected := signedFixture(t, "success")
+	expected.WorkflowDigest = "sha256:" + strings.Repeat("d", 64)
+	decision := Verify(envelope, publicKey, expected)
+	if decision.Accepted || decision.Code != "workflow_mismatch" {
+		t.Fatalf("decision = %+v, want workflow_mismatch", decision)
+	}
+}
+
+func TestVerifyRejectsChangedEnvironmentDigest(t *testing.T) {
+	envelope, publicKey, expected := signedFixture(t, "success")
+	expected.EnvironmentDigest = "sha256:" + strings.Repeat("d", 64)
+	decision := Verify(envelope, publicKey, expected)
+	if decision.Accepted || decision.Code != "environment_mismatch" {
+		t.Fatalf("decision = %+v, want environment_mismatch", decision)
+	}
+}
+
 func TestVerifyRejectsChangedArchitecture(t *testing.T) {
 	envelope, publicKey, expected := signedFixture(t, "success")
 	expected.Architecture = "linux/amd64"
