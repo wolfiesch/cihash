@@ -53,5 +53,22 @@ jobs:
           git -c user.name=CIHash -c user.email=cihash@example.invalid \
             merge --no-commit --no-ff --no-verify "$CIHASH_BASE_SHA"
 
-      - name: Verify
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt required for:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
         run: go test ./...
