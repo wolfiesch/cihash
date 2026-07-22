@@ -78,14 +78,14 @@ func TestStoreEnforcesRunLifecycle(t *testing.T) {
 	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
 	grant := testGrant(t, now)
 	store := NewStore(t.TempDir())
-	created, err := store.Create(grant)
+	created, err := store.Create(grant, testRunContext())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if created.Status != StatusIssued {
 		t.Fatalf("created status = %q, want %q", created.Status, StatusIssued)
 	}
-	if _, err := store.Create(grant); !errors.Is(err, ErrLifecycleConflict) {
+	if _, err := store.Create(grant, testRunContext()); !errors.Is(err, ErrLifecycleConflict) {
 		t.Fatalf("duplicate create error = %v, want ErrLifecycleConflict", err)
 	}
 	if _, err := store.MarkConsumed(grant.ID, now.Add(time.Minute)); !errors.Is(err, ErrLifecycleConflict) {
@@ -123,7 +123,7 @@ func TestStoreRecoversEachPersistedLifecycleTransition(t *testing.T) {
 	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
 	grant := testGrant(t, now)
 	root := t.TempDir()
-	if _, err := NewStore(root).Create(grant); err != nil {
+	if _, err := NewStore(root).Create(grant, testRunContext()); err != nil {
 		t.Fatal(err)
 	}
 	issued, found, err := NewStore(root).Lookup(grant.ID, now.Add(time.Second))
@@ -151,7 +151,7 @@ func TestStoreRejectsExpiredOrConflictingSubmission(t *testing.T) {
 	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
 	grant := testGrant(t, now)
 	store := NewStore(t.TempDir())
-	if _, err := store.Create(grant); err != nil {
+	if _, err := store.Create(grant, testRunContext()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -163,7 +163,7 @@ func TestStoreRejectsExpiredOrConflictingSubmission(t *testing.T) {
 		t.Fatalf("expired submission error = %v, want ErrGrantExpired", err)
 	}
 	grant2 := testGrantWithEntropy(t, now, 4)
-	if _, err := store.Create(grant2); err != nil {
+	if _, err := store.Create(grant2, testRunContext()); err != nil {
 		t.Fatal(err)
 	}
 	receiptDigest := attestation.Digest([]byte("accepted-receipt"))
@@ -187,7 +187,7 @@ func TestStoreRejectsExpiredOrConflictingSubmission(t *testing.T) {
 func TestStoreRequiresProvisionedRoot(t *testing.T) {
 	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
 	root := filepath.Join(t.TempDir(), "missing")
-	if _, err := NewStore(root).Create(testGrant(t, now)); err == nil || !strings.Contains(err.Error(), "inspect run grant root") {
+	if _, err := NewStore(root).Create(testGrant(t, now), testRunContext()); err == nil || !strings.Contains(err.Error(), "inspect run grant root") {
 		t.Fatalf("unprovisioned root error = %v", err)
 	}
 }
@@ -196,7 +196,7 @@ func TestStoreRejectsTamperedStateAndConcurrentMutation(t *testing.T) {
 	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
 	grant := testGrant(t, now)
 	store := NewStore(t.TempDir())
-	if _, err := store.Create(grant); err != nil {
+	if _, err := store.Create(grant, testRunContext()); err != nil {
 		t.Fatal(err)
 	}
 	lock, err := os.OpenFile(store.lockPath(grant.ID), os.O_RDWR|os.O_CREATE, 0o600)
@@ -262,4 +262,8 @@ func testPolicy() policy.Policy {
 		MaxAgeSeconds:  3600,
 		TimeoutSeconds: 300,
 	}
+}
+
+func testRunContext() Context {
+	return Context{InstallationID: 123, PullRequestNumber: 7}
 }

@@ -97,7 +97,7 @@ while the grant remains valid.
 
 ## Pull-request decision flow
 
-For `opened`, `reopened`, `synchronize`, and `ready_for_review` events:
+For `opened`, `reopened`, `synchronize`, `ready_for_review`, and `edited` events:
 
 1. read the current PR and GitHub test-merge ref instead of trusting revision fields in the webhook body, then require the merge commit's two parents to equal the current base and head before accepting its tree;
 2. reject fork PRs, which are outside the v0.1 trust boundary;
@@ -109,6 +109,44 @@ For `opened`, `reopened`, `synchronize`, and `ready_for_review` events:
 8. create a queued check and dispatch the trusted fallback workflow in enforcement mode.
 
 Webhook delivery IDs are persisted. Completed or concurrent duplicate deliveries do not create another check.
+
+### Evidence timing
+
+Evaluation happens at supported pull-request events and, for verified
+successful receipts, immediately at submission. `POST
+/api/v1/runs/{run-id}/receipt` verifies and stores the evidence, then
+re-evaluates the granted pull request: the service re-resolves the current
+head, base, and merge tree through GitHub and acts only when they still equal
+the granted revisions. Anything else is logged and left to the event-driven
+path, which stays authoritative.
+
+- In shadow mode, an accepted late proof publishes a new completed App check
+  and records a shadow decision.
+- In enforcement mode, an accepted late proof performs three separate ordered
+  operations: it consumes the run through the store's locked monotonic
+  lifecycle, updates this pull request's own pending queued check to
+  `success`, and only after a successful update marks the dispatched fallback
+  `superseded` so its later `workflow_run` completion is ignored. If the check
+  update fails, the fallback state is untouched and the fallback remains
+  authoritative. If the state transition fails after a successful update, the
+  fallback later overwrites the check with its real conclusion, which errs
+  closed. If the fallback already completed the check, the late proof changes
+  nothing.
+- Rejected and diagnostic receipts never publish a check and never dispatch
+  fallback from the submission path.
+
+Fallback state is indexed by repository, installation, pull request, and the
+App check's external identity, so pull requests that share a head commit
+cannot supersede each other's checks.
+
+Because grant issuance resolves an existing pull request, the first evaluation
+of a freshly pushed head still records `proof_missing` and, in enforcement
+mode, dispatches fallback. The receipt-triggered path exists so evidence that
+completes minutes later still concludes that check without waiting for the
+fallback workflow. Superseding removes only the fallback's authority, not its
+compute: the dispatched run finishes harmlessly.
+
+### Shadow parity evidence
 
 In shadow mode, `shadowWorkflow` and `shadowJob` select the ordinary Actions
 job used for parity evidence. CIHash accepts only first-attempt `pull_request`
@@ -133,7 +171,7 @@ The fallback workflow must live on the protected base branch and declare these `
 - `cihash_external_id`
 - `cihash_policy_digest`
 
-The committed `.github/workflows/cihash-fallback.yml` is the CIHash repository's reference implementation. It checks out the exact base SHA, fetches the exact head SHA, prepares their merge tree, and runs the repository verification command. `actions/checkout` is pinned to the v5.0.0 release commit.
+The committed `.github/workflows/cihash-fallback.yml` is the CIHash repository's reference implementation. It checks out the exact base SHA, fetches the exact head SHA, prepares their merge tree, and runs the same formatting, vet, and test gates as the repository's ordinary CI workflow. `actions/checkout` and `actions/setup-go` are pinned to release commits.
 
 CIHash records the workflow run ID returned by GitHub's dispatch endpoint. A signed `workflow_run: completed` webhook can finish the queued check only when:
 

@@ -44,12 +44,15 @@ func TestFallbackStateRecoversMonotonicallyAcrossRestarts(t *testing.T) {
 	root := t.TempDir()
 	now := time.Date(2026, time.July, 21, 12, 0, 0, 0, time.UTC)
 	state := FallbackState{
-		ID:             "fallback-recovery",
-		Repository:     "owner/project",
-		InstallationID: 123,
-		CheckRunID:     456,
-		Workflow:       "cihash-fallback.yml",
-		ExpiresAt:      now.Add(time.Hour),
+		ID:                "fallback-recovery",
+		Repository:        "owner/project",
+		InstallationID:    123,
+		PullRequestNumber: 7,
+		CheckRunID:        456,
+		Workflow:          "cihash-fallback.yml",
+		HeadSHA:           "aaaa",
+		ExternalID:        "identity-key",
+		ExpiresAt:         now.Add(time.Hour),
 	}
 	if err := NewStateStore(root).CreateFallback(state); err != nil {
 		t.Fatal(err)
@@ -74,10 +77,14 @@ func TestFallbackStateRecoversMonotonicallyAcrossRestarts(t *testing.T) {
 
 func TestFallbackStateRequiresWorkflowIdentity(t *testing.T) {
 	state := FallbackState{
-		ID:             "fallback-no-workflow",
-		InstallationID: 123,
-		CheckRunID:     456,
-		ExpiresAt:      time.Now().Add(time.Hour),
+		ID:                "fallback-no-workflow",
+		Repository:        "owner/project",
+		InstallationID:    123,
+		PullRequestNumber: 7,
+		CheckRunID:        456,
+		HeadSHA:           "aaaa",
+		ExternalID:        "identity-key",
+		ExpiresAt:         time.Now().Add(time.Hour),
 	}
 	if err := NewStateStore(t.TempDir()).CreateFallback(state); err == nil {
 		t.Fatal("CreateFallback succeeded without workflow identity")
@@ -87,11 +94,15 @@ func TestFallbackStateRequiresWorkflowIdentity(t *testing.T) {
 func TestFallbackStateCorruptionFailsClosed(t *testing.T) {
 	root := t.TempDir()
 	state := FallbackState{
-		ID:             "fallback-corrupt",
-		InstallationID: 123,
-		CheckRunID:     456,
-		Workflow:       "cihash-fallback.yml",
-		ExpiresAt:      time.Now().Add(time.Hour),
+		ID:                "fallback-corrupt",
+		Repository:        "owner/project",
+		InstallationID:    123,
+		PullRequestNumber: 7,
+		CheckRunID:        456,
+		Workflow:          "cihash-fallback.yml",
+		HeadSHA:           "aaaa",
+		ExternalID:        "identity-key",
+		ExpiresAt:         time.Now().Add(time.Hour),
 	}
 	store := NewStateStore(root)
 	if err := store.CreateFallback(state); err != nil {

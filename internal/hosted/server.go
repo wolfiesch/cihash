@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wolfiesch/cihash/internal/attestation"
@@ -30,11 +31,12 @@ import (
 )
 
 const (
-	maxWebhookBody  = 1 << 20
-	maxReceiptBody  = 8 << 20
-	maxReceiptLog   = 4 << 20
-	fallbackIDBytes = 24
-	runsEndpoint    = "/api/v1/runs"
+	maxWebhookBody      = 1 << 20
+	reevaluationTimeout = 30 * time.Second
+	maxReceiptBody      = 8 << 20
+	maxReceiptLog       = 4 << 20
+	fallbackIDBytes     = 24
+	runsEndpoint        = "/api/v1/runs"
 )
 
 type GitHubClient interface {
@@ -60,6 +62,7 @@ type Server struct {
 	startedAt     time.Time
 	github        GitHubClient
 	logger        *log.Logger
+	fallbackMu    sync.Mutex
 	now           func() time.Time
 }
 
@@ -243,7 +246,7 @@ func (server *Server) handleRuns(response http.ResponseWriter, request *http.Req
 		http.Error(response, "run issuance unavailable", http.StatusInternalServerError)
 		return
 	}
-	if _, err := server.grantStore.Create(grant); err != nil {
+	if _, err := server.grantStore.Create(grant, rungrant.Context{InstallationID: issue.InstallationID, PullRequestNumber: issue.PullRequestNumber}); err != nil {
 		server.logger.Printf("persist run grant: %v", err)
 		http.Error(response, "run issuance unavailable", http.StatusInternalServerError)
 		return
@@ -357,6 +360,14 @@ func (server *Server) handleReceipt(response http.ResponseWriter, request *http.
 		server.logger.Printf("persist receipt evidence: %v", err)
 		http.Error(response, "receipt persistence unavailable", http.StatusInternalServerError)
 		return
+	}
+	if decision.Accepted {
+		// The evidence is durably stored; re-evaluation must not die with the
+		// producer's connection. Detach from request cancellation and bound the
+		// GitHub round trips instead.
+		reevalCtx, cancel := context.WithTimeout(context.WithoutCancel(request.Context()), reevaluationTimeout)
+		server.reevaluateRun(reevalCtx, record.Grant, record.Context)
+		cancel()
 	}
 	status := http.StatusOK
 	if record.Status == rungrant.StatusIssued {
@@ -512,33 +523,8 @@ func (server *Server) handlePullRequest(ctx context.Context, body []byte) error 
 		return err
 	}
 	if server.config.Mode == githubapp.ShadowMode {
-		evaluatedAt := server.now()
-		serviceStartedAt := server.startedAt
-		if serviceStartedAt.After(evaluatedAt) {
-			serviceStartedAt = evaluatedAt
-		}
-		if _, err := server.shadowStore.RecordDecision(shadow.Decision{
-			Repository:            server.config.Repository,
-			PullRequestNumber:     payload.Number,
-			HeadSHA:               current.HeadSHA,
-			BaseSHA:               current.BaseSHA,
-			TreeSHA:               current.TreeSHA,
-			PolicyDigest:          expected.PolicyDigest,
-			ProofAccepted:         decision.Accepted,
-			ProofCode:             decision.Code,
-			Comparable:            comparableProofDecision(decision),
-			CheckRunID:            checkRunID,
-			EvaluatedAt:           evaluatedAt,
-			VerificationMillis:    verificationMillis,
-			AppDecisionMillis:     time.Since(operationStarted).Milliseconds(),
-			ServiceSourceRevision: server.serviceBuild.sourceRevision,
-			ServiceBinaryDigest:   server.serviceBuild.binaryDigest,
-			ServiceBuildMode:      server.config.BuildMode,
-			ServiceSourceModified: server.serviceBuild.sourceModified,
-			ServiceStartedAt:      serviceStartedAt,
-			PolicyTimeoutSeconds:  server.policy.TimeoutSeconds,
-		}); err != nil {
-			return fmt.Errorf("record shadow decision: %w", err)
+		if err := server.recordShadowDecision(payload.Number, current, expected.PolicyDigest, decision, checkRunID, verificationMillis, time.Since(operationStarted).Milliseconds()); err != nil {
+			return err
 		}
 	}
 	if !decision.FallbackRequired {
@@ -640,18 +626,19 @@ func (server *Server) dispatchFallback(ctx context.Context, token string, payloa
 	}
 	now := server.now()
 	state := FallbackState{
-		ID:             fallbackID,
-		Repository:     server.config.Repository,
-		InstallationID: payload.Installation.ID,
-		CheckRunID:     checkRunID,
-		HeadSHA:        payload.PullRequest.Head.SHA,
-		Workflow:       server.config.FallbackWorkflow,
-		BaseSHA:        payload.PullRequest.Base.SHA,
-		BaseRef:        payload.PullRequest.Base.Ref,
-		PolicyDigest:   policyDigest,
-		ExternalID:     decision.CheckRun.ExternalID,
-		CreatedAt:      now,
-		ExpiresAt:      now.Add(2 * time.Hour),
+		ID:                fallbackID,
+		Repository:        server.config.Repository,
+		InstallationID:    payload.Installation.ID,
+		PullRequestNumber: payload.Number,
+		CheckRunID:        checkRunID,
+		HeadSHA:           payload.PullRequest.Head.SHA,
+		Workflow:          server.config.FallbackWorkflow,
+		BaseSHA:           payload.PullRequest.Base.SHA,
+		BaseRef:           payload.PullRequest.Base.Ref,
+		PolicyDigest:      policyDigest,
+		ExternalID:        decision.CheckRun.ExternalID,
+		CreatedAt:         now,
+		ExpiresAt:         now.Add(2 * time.Hour),
 	}
 	if err := server.stateStore.CreateFallback(state); err != nil {
 		return err
@@ -758,6 +745,8 @@ func (server *Server) handleWorkflowRun(ctx context.Context, body []byte) error 
 		}
 		return nil
 	}
+	server.fallbackMu.Lock()
+	defer server.fallbackMu.Unlock()
 	state, found, err := server.stateStore.LookupWorkflowRun(payload.WorkflowRun.ID)
 	if err != nil {
 		return err
@@ -876,6 +865,144 @@ func fallbackConclusion(payload workflowRunPayload, state FallbackState, now tim
 }
 func comparableProofDecision(decision githubapp.Result) bool {
 	return decision.Accepted || decision.Code == "job_failed" || decision.Code == "proof_failed"
+}
+
+func (server *Server) recordShadowDecision(pullRequestNumber int64, current githubapi.PullRequestState, policyDigest string, decision githubapp.Result, checkRunID int64, verificationMillis, appDecisionMillis int64) error {
+	evaluatedAt := server.now()
+	serviceStartedAt := server.startedAt
+	if serviceStartedAt.After(evaluatedAt) {
+		serviceStartedAt = evaluatedAt
+	}
+	if _, err := server.shadowStore.RecordDecision(shadow.Decision{
+		Repository:            server.config.Repository,
+		PullRequestNumber:     pullRequestNumber,
+		HeadSHA:               current.HeadSHA,
+		BaseSHA:               current.BaseSHA,
+		TreeSHA:               current.TreeSHA,
+		PolicyDigest:          policyDigest,
+		ProofAccepted:         decision.Accepted,
+		ProofCode:             decision.Code,
+		Comparable:            comparableProofDecision(decision),
+		CheckRunID:            checkRunID,
+		EvaluatedAt:           evaluatedAt,
+		VerificationMillis:    verificationMillis,
+		AppDecisionMillis:     appDecisionMillis,
+		ServiceSourceRevision: server.serviceBuild.sourceRevision,
+		ServiceBinaryDigest:   server.serviceBuild.binaryDigest,
+		ServiceBuildMode:      server.config.BuildMode,
+		ServiceSourceModified: server.serviceBuild.sourceModified,
+		ServiceStartedAt:      serviceStartedAt,
+		PolicyTimeoutSeconds:  server.policy.TimeoutSeconds,
+	}); err != nil {
+		return fmt.Errorf("record shadow decision: %w", err)
+	}
+	return nil
+}
+
+// reevaluateRun re-evaluates the granted pull request immediately after a
+// verified successful receipt is stored, so evidence staged between webhook
+// events can still conclude the App-owned check. It never dispatches fallback
+// and fails closed on any mismatch; the event-driven path stays authoritative.
+func (server *Server) reevaluateRun(ctx context.Context, grant rungrant.Grant, runContext rungrant.Context) {
+	if runContext.InstallationID <= 0 || runContext.PullRequestNumber <= 0 {
+		return
+	}
+	token, err := server.github.InstallationToken(ctx, runContext.InstallationID, server.config.Repository)
+	if err != nil {
+		server.logger.Printf("re-evaluate run %s: installation token: %v", grant.ID, err)
+		return
+	}
+	current, err := server.github.GetPullRequest(ctx, token, server.config.Repository, runContext.PullRequestNumber)
+	if err != nil {
+		server.logger.Printf("re-evaluate run %s: pull request: %v", grant.ID, err)
+		return
+	}
+	if current.HeadRepository != server.config.Repository {
+		return
+	}
+	if current.HeadSHA != grant.HeadSHA || current.BaseSHA != grant.BaseSHA || current.TreeSHA != grant.TreeSHA {
+		server.logger.Printf("re-evaluate run %s: GitHub state moved past the granted revisions", grant.ID)
+		return
+	}
+	operationStarted := time.Now()
+	expected, err := verifier.ExpectedFromPolicy(server.policy, current.HeadSHA, current.BaseSHA, "", server.now())
+	if err != nil {
+		server.logger.Printf("re-evaluate run %s: expected identity: %v", grant.ID, err)
+		return
+	}
+	expected.TreeSHA = current.TreeSHA
+	verificationStarted := time.Now()
+	decision := server.evaluateBoundProof(expected)
+	verificationMillis := time.Since(verificationStarted).Milliseconds()
+	if !decision.Accepted {
+		server.logger.Printf("re-evaluate run %s: proof not accepted: %s: %s", grant.ID, decision.Code, decision.Message)
+		return
+	}
+	decision.CheckRun.Name = server.config.CheckName
+	if server.config.DetailsURL != "" {
+		decision.CheckRun.DetailsURL = server.config.DetailsURL
+	}
+	if server.config.Mode == githubapp.EnforceMode {
+		server.concludeSupersededFallback(ctx, token, grant, runContext, decision)
+		return
+	}
+	checkRunID, err := server.github.CreateCheckRun(ctx, token, server.config.Repository, decision.CheckRun)
+	if err != nil {
+		server.logger.Printf("re-evaluate run %s: create check: %v", grant.ID, err)
+		return
+	}
+	if err := server.recordShadowDecision(runContext.PullRequestNumber, current, expected.PolicyDigest, decision, checkRunID, verificationMillis, time.Since(operationStarted).Milliseconds()); err != nil {
+		server.logger.Printf("re-evaluate run %s: %v", grant.ID, err)
+	}
+}
+
+// concludeSupersededFallback flips the queued check owned by this pull
+// request's pending fallback to success for an accepted proof, then marks the
+// fallback state superseded so its later workflow_run completion is ignored.
+// The check update happens before the state transition: if the update fails,
+// the fallback remains authoritative and can still conclude the check.
+func (server *Server) concludeSupersededFallback(ctx context.Context, token string, grant rungrant.Grant, runContext rungrant.Context, decision githubapp.Result) {
+	server.fallbackMu.Lock()
+	defer server.fallbackMu.Unlock()
+	state, found, err := server.stateStore.LookupFallbackByOwner(server.config.Repository, runContext.InstallationID, runContext.PullRequestNumber, decision.CheckRun.ExternalID)
+	if err != nil {
+		server.logger.Printf("re-evaluate run %s: lookup fallback: %v", grant.ID, err)
+		return
+	}
+	if found {
+		if state.CompletedAt != nil {
+			return
+		}
+		if state.Repository != server.config.Repository ||
+			state.InstallationID != runContext.InstallationID ||
+			state.PullRequestNumber != runContext.PullRequestNumber ||
+			state.HeadSHA != grant.HeadSHA ||
+			state.BaseSHA != grant.BaseSHA ||
+			state.ExternalID != decision.CheckRun.ExternalID {
+			server.logger.Printf("re-evaluate run %s: pending fallback identity does not match the granted run", grant.ID)
+			return
+		}
+		now := server.now()
+		update := githubapi.CheckRunUpdate{
+			Name:        server.config.CheckName,
+			Status:      "completed",
+			Conclusion:  "success",
+			ExternalID:  state.ExternalID,
+			CompletedAt: now.UTC().Format(time.RFC3339),
+			Output:      decision.CheckRun.Output,
+		}
+		if err := server.github.UpdateCheckRun(ctx, token, server.config.Repository, state.CheckRunID, update); err != nil {
+			server.logger.Printf("re-evaluate run %s: update check: %v", grant.ID, err)
+			return
+		}
+		if err := server.stateStore.CompleteFallback(state.ID, "superseded", now); err != nil {
+			server.logger.Printf("re-evaluate run %s: supersede fallback: %v", grant.ID, err)
+		}
+		return
+	}
+	if _, err := server.github.CreateCheckRun(ctx, token, server.config.Repository, decision.CheckRun); err != nil {
+		server.logger.Printf("re-evaluate run %s: create check: %v", grant.ID, err)
+	}
 }
 
 func supportedPullRequestAction(action string) bool {

@@ -30,8 +30,23 @@ const (
 	StatusExpired   Status = "expired"
 )
 
+// Context binds a stored run to the GitHub surface it was issued for, so a
+// verified receipt can locate the exact pull request it may re-evaluate.
+type Context struct {
+	InstallationID    int64 `json:"installationId"`
+	PullRequestNumber int64 `json:"pullRequestNumber"`
+}
+
+func (context Context) validate() error {
+	if context.InstallationID <= 0 || context.PullRequestNumber <= 0 {
+		return fmt.Errorf("run context requires a positive installation and pull request")
+	}
+	return nil
+}
+
 type Record struct {
 	Grant         Grant      `json:"grant"`
+	Context       Context    `json:"context"`
 	Status        Status     `json:"status"`
 	ReceiptDigest string     `json:"receiptDigest,omitempty"`
 	SubmittedAt   *time.Time `json:"submittedAt,omitempty"`
@@ -46,14 +61,17 @@ func NewStore(root string) Store {
 	return Store{root: root}
 }
 
-func (store Store) Create(grant Grant) (Record, error) {
+func (store Store) Create(grant Grant, runContext Context) (Record, error) {
 	if err := grant.Validate(); err != nil {
+		return Record{}, err
+	}
+	if err := runContext.validate(); err != nil {
 		return Record{}, err
 	}
 	if err := store.ensureDirectory(); err != nil {
 		return Record{}, err
 	}
-	record := Record{Grant: grant, Status: StatusIssued}
+	record := Record{Grant: grant, Context: runContext, Status: StatusIssued}
 	data, err := marshalRecord(record)
 	if err != nil {
 		return Record{}, err
@@ -208,6 +226,9 @@ func (store Store) load(id string) (Record, error) {
 
 func validateRecord(record Record) error {
 	if err := record.Grant.Validate(); err != nil {
+		return err
+	}
+	if err := record.Context.validate(); err != nil {
 		return err
 	}
 	switch record.Status {

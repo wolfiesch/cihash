@@ -19,21 +19,22 @@ type StateStore struct {
 }
 
 type FallbackState struct {
-	ID             string     `json:"id"`
-	Repository     string     `json:"repository"`
-	InstallationID int64      `json:"installationId"`
-	CheckRunID     int64      `json:"checkRunId"`
-	WorkflowRunID  int64      `json:"workflowRunId,omitempty"`
-	Workflow       string     `json:"workflow"`
-	HeadSHA        string     `json:"headSha"`
-	BaseSHA        string     `json:"baseSha"`
-	BaseRef        string     `json:"baseRef"`
-	PolicyDigest   string     `json:"policyDigest"`
-	ExternalID     string     `json:"externalId"`
-	CreatedAt      time.Time  `json:"createdAt"`
-	ExpiresAt      time.Time  `json:"expiresAt"`
-	CompletedAt    *time.Time `json:"completedAt,omitempty"`
-	Conclusion     string     `json:"conclusion,omitempty"`
+	ID                string     `json:"id"`
+	Repository        string     `json:"repository"`
+	InstallationID    int64      `json:"installationId"`
+	PullRequestNumber int64      `json:"pullRequestNumber"`
+	CheckRunID        int64      `json:"checkRunId"`
+	WorkflowRunID     int64      `json:"workflowRunId,omitempty"`
+	Workflow          string     `json:"workflow"`
+	HeadSHA           string     `json:"headSha"`
+	BaseSHA           string     `json:"baseSha"`
+	BaseRef           string     `json:"baseRef"`
+	PolicyDigest      string     `json:"policyDigest"`
+	ExternalID        string     `json:"externalId"`
+	CreatedAt         time.Time  `json:"createdAt"`
+	ExpiresAt         time.Time  `json:"expiresAt"`
+	CompletedAt       *time.Time `json:"completedAt,omitempty"`
+	Conclusion        string     `json:"conclusion,omitempty"`
 }
 
 func NewStateStore(root string) StateStore {
@@ -111,7 +112,8 @@ func (store StateStore) FailDelivery(deliveryID string) {
 }
 
 func (store StateStore) CreateFallback(state FallbackState) error {
-	if state.ID == "" || state.CheckRunID <= 0 || state.InstallationID <= 0 || state.Workflow == "" || state.ExpiresAt.IsZero() {
+	if state.ID == "" || state.Repository == "" || state.CheckRunID <= 0 || state.InstallationID <= 0 || state.PullRequestNumber <= 0 ||
+		state.Workflow == "" || state.HeadSHA == "" || state.ExternalID == "" || state.ExpiresAt.IsZero() {
 		return fmt.Errorf("fallback state is incomplete")
 	}
 	directory := filepath.Join(store.root, "fallbacks")
@@ -124,7 +126,15 @@ func (store StateStore) CreateFallback(state FallbackState) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect fallback state: %w", err)
 	}
-	return writeJSONAtomic(path, state)
+	if err := writeJSONAtomic(path, state); err != nil {
+		return err
+	}
+	indexDirectory := filepath.Join(store.root, "fallback-index")
+	if err := ensureStateDirectory(indexDirectory); err != nil {
+		return err
+	}
+	indexKey := fallbackOwnerKey(state.Repository, state.InstallationID, state.PullRequestNumber, state.ExternalID)
+	return writeBytesAtomic(filepath.Join(indexDirectory, indexKey), []byte(state.ID+"\n"), 0o600)
 }
 
 func (store StateStore) BindWorkflowRun(fallbackID string, workflowRunID int64) error {
@@ -176,6 +186,34 @@ func (store StateStore) LookupFallback(fallbackID string) (FallbackState, bool, 
 	return state, true, nil
 }
 
+// LookupFallbackByOwner resolves the most recently dispatched fallback for one
+// pull request and exact proof identity. The index key commits to the
+// repository, installation, pull request, and the App check's external ID, so
+// pull requests that share a proof identity cannot shadow each other's
+// fallback state.
+func (store StateStore) LookupFallbackByOwner(repository string, installationID, pullRequestNumber int64, externalID string) (FallbackState, bool, error) {
+	if repository == "" || installationID <= 0 || pullRequestNumber <= 0 || externalID == "" {
+		return FallbackState{}, false, nil
+	}
+	indexKey := fallbackOwnerKey(repository, installationID, pullRequestNumber, externalID)
+	fallbackID, err := os.ReadFile(filepath.Join(store.root, "fallback-index", indexKey))
+	if errors.Is(err, os.ErrNotExist) {
+		return FallbackState{}, false, nil
+	}
+	if err != nil {
+		return FallbackState{}, false, fmt.Errorf("read fallback identity index: %w", err)
+	}
+	state, _, err := store.loadFallback(stringTrimSpace(fallbackID))
+	if err != nil {
+		return FallbackState{}, false, err
+	}
+	return state, true, nil
+}
+
+func fallbackOwnerKey(repository string, installationID, pullRequestNumber int64, externalID string) string {
+	return digestName(fmt.Sprintf("%s\x00%d\x00%d\x00%s", repository, installationID, pullRequestNumber, externalID))
+}
+
 func (store StateStore) CompleteFallback(fallbackID, conclusion string, completedAt time.Time) error {
 	state, path, err := store.loadFallback(fallbackID)
 	if err != nil {
@@ -203,7 +241,7 @@ func (store StateStore) loadFallback(fallbackID string) (FallbackState, string, 
 	if err := json.Unmarshal(data, &state); err != nil {
 		return FallbackState{}, path, fmt.Errorf("decode fallback state: %w", err)
 	}
-	if state.ID != fallbackID || state.CheckRunID <= 0 || state.InstallationID <= 0 || state.Workflow == "" || state.ExpiresAt.IsZero() {
+	if state.ID != fallbackID || state.CheckRunID <= 0 || state.InstallationID <= 0 || state.PullRequestNumber <= 0 || state.Workflow == "" || state.ExpiresAt.IsZero() {
 		return FallbackState{}, path, fmt.Errorf("fallback state identity or required fields are invalid")
 	}
 	return state, path, nil

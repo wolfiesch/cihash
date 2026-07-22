@@ -245,18 +245,19 @@ func TestWorkflowRunRecoversFallbackBindingAfterCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := FallbackState{
-		ID:             fallbackID,
-		Repository:     "owner/project",
-		InstallationID: 123,
-		CheckRunID:     314,
-		Workflow:       "cihash-fallback.yml",
-		HeadSHA:        headSHA,
-		BaseSHA:        baseSHA,
-		BaseRef:        "main",
-		PolicyDigest:   policyDigest,
-		ExternalID:     "cihash-recovery",
-		CreatedAt:      server.now(),
-		ExpiresAt:      server.now().Add(2 * time.Hour),
+		ID:                fallbackID,
+		Repository:        "owner/project",
+		InstallationID:    123,
+		PullRequestNumber: 7,
+		CheckRunID:        314,
+		Workflow:          "cihash-fallback.yml",
+		HeadSHA:           headSHA,
+		BaseSHA:           baseSHA,
+		BaseRef:           "main",
+		PolicyDigest:      policyDigest,
+		ExternalID:        "cihash-recovery",
+		CreatedAt:         server.now(),
+		ExpiresAt:         server.now().Add(2 * time.Hour),
 	}
 	if err := server.stateStore.CreateFallback(state); err != nil {
 		t.Fatal(err)
@@ -417,7 +418,10 @@ type recordedDispatch struct {
 	request  githubapi.WorkflowDispatch
 }
 
-func (client *fakeGitHubClient) InstallationToken(_ context.Context, installationID int64, repository string) (string, error) {
+func (client *fakeGitHubClient) InstallationToken(ctx context.Context, installationID int64, repository string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	client.tokenCalls++
 	if installationID != 123 || repository != "owner/project" {
 		return "", io.ErrUnexpectedEOF
@@ -476,7 +480,7 @@ func (client *fakeGitHubClient) DispatchWorkflow(_ context.Context, token, repos
 	return 99, nil
 }
 
-func hostedFixture(t *testing.T, mode githubapp.Mode, withProof bool) (*Server, *fakeGitHubClient, []byte, string, string) {
+func newHostedServer(t *testing.T, mode githubapp.Mode) (*Server, *fakeGitHubClient, []byte, ed25519.PrivateKey) {
 	t.Helper()
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -513,31 +517,38 @@ func hostedFixture(t *testing.T, mode githubapp.Mode, withProof bool) (*Server, 
 	}
 	fixedNow := time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)
 	server.now = func() time.Time { return fixedNow }
+	return server, client, secret, privateKey
+}
+
+func hostedFixture(t *testing.T, mode githubapp.Mode, withProof bool) (*Server, *fakeGitHubClient, []byte, string, string) {
+	t.Helper()
+	server, client, secret, privateKey := newHostedServer(t, mode)
+	fixedNow := server.now()
 	headSHA := strings.Repeat("a", 40)
 	baseSHA := strings.Repeat("b", 40)
 	if withProof {
 		treeSHA := strings.Repeat("c", 40)
-		grant, err := rungrant.Issue(configuredPolicy, headSHA, baseSHA, treeSHA, fixedNow.Add(-2*time.Minute))
+		grant, err := rungrant.Issue(server.policy, headSHA, baseSHA, treeSHA, fixedNow.Add(-2*time.Minute))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := server.grantStore.Create(grant); err != nil {
+		if _, err := server.grantStore.Create(grant, rungrant.Context{InstallationID: 123, PullRequestNumber: 7}); err != nil {
 			t.Fatal(err)
 		}
 		result := attestation.TestResult{
 			SchemaVersion:     attestation.SchemaVersion,
-			Repository:        configuredPolicy.Repository,
+			Repository:        server.policy.Repository,
 			HeadSHA:           headSHA,
 			BaseSHA:           baseSHA,
 			TreeSHA:           treeSHA,
-			Profile:           configuredPolicy.Profile,
+			Profile:           server.policy.Profile,
 			PolicyDigest:      grant.PolicyDigest,
 			WorkflowDigest:    grant.WorkflowDigest,
 			EnvironmentDigest: grant.EnvironmentDigest,
 			Architecture:      grant.Architecture,
 			Jobs: []attestation.JobResult{{
-				Name:        configuredPolicy.Profile,
-				Command:     configuredPolicy.Command,
+				Name:        server.policy.Profile,
+				Command:     server.policy.Command,
 				Conclusion:  "success",
 				StartedAt:   fixedNow.Add(-time.Minute),
 				CompletedAt: fixedNow.Add(-time.Second),
@@ -560,7 +571,7 @@ func hostedFixture(t *testing.T, mode githubapp.Mode, withProof bool) (*Server, 
 		if _, err := server.grantStore.MarkSubmitted(grant.ID, receiptDigest, fixedNow); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := store.New(config.ReceiptStore).SaveForRun(grant.ID, store.IdentityFromResult(result), envelope, []byte("passed")); err != nil {
+		if _, _, err := server.receiptStore.SaveForRun(grant.ID, store.IdentityFromResult(result), envelope, []byte("passed")); err != nil {
 			t.Fatal(err)
 		}
 	}
