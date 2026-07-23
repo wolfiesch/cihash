@@ -70,10 +70,16 @@ func TestCheckAndWorkflowRequestsUseInstallationToken(t *testing.T) {
 		}
 		switch {
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/project/pulls/7":
+			if version := request.Header.Get("X-GitHub-Api-Version"); version != pullRequestMergeAPIVersion {
+				t.Fatalf("pull request API version = %q", version)
+			}
 			pullSeen = true
 			response.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(response, `{"state":"open","head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repo":{"full_name":"owner/project"}},"base":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"main"},"merge_commit_sha":"cccccccccccccccccccccccccccccccccccccccc"}`)
 		case request.Method == http.MethodGet && request.URL.Path == "/repos/owner/project/git/commits/cccccccccccccccccccccccccccccccccccccccc":
+			if version := request.Header.Get("X-GitHub-Api-Version"); version != apiVersion {
+				t.Fatalf("merge commit API version = %q", version)
+			}
 			mergeCommitSeen = true
 			response.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(response, `{"tree":{"sha":"dddddddddddddddddddddddddddddddddddddddd"},"parents":[{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}`)

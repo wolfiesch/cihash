@@ -23,7 +23,10 @@ import (
 	"github.com/wolfiesch/cihash/internal/githubapp"
 )
 
-const apiVersion = "2026-03-10"
+const (
+	apiVersion                 = "2026-03-10"
+	pullRequestMergeAPIVersion = "2022-11-28"
+)
 
 type Client struct {
 	baseURL    string
@@ -163,7 +166,7 @@ func (client *Client) GetPullRequest(ctx context.Context, token, repository stri
 		State          string `json:"state"`
 	}
 	path := "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/pulls/" + strconv.FormatInt(number, 10)
-	if err := client.do(ctx, http.MethodGet, path, token, nil, http.StatusOK, &response); err != nil {
+	if err := client.doVersion(ctx, http.MethodGet, path, token, nil, http.StatusOK, &response, pullRequestMergeAPIVersion); err != nil {
 		return PullRequestState{}, err
 	}
 	if response.State != "open" {
@@ -339,6 +342,11 @@ func (client *Client) appJWT() (string, error) {
 }
 
 func (client *Client) do(ctx context.Context, method, path, token string, body any, expectedStatus int, output any) error {
+	return client.doVersion(ctx, method, path, token, body, expectedStatus, output, apiVersion)
+}
+
+// GitHub's 2026-03-10 pull representation omits merge_commit_sha.
+func (client *Client) doVersion(ctx context.Context, method, path, token string, body any, expectedStatus int, output any, version string) error {
 	var requestBody io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
@@ -353,7 +361,7 @@ func (client *Client) do(ctx context.Context, method, path, token string, body a
 	}
 	request.Header.Set("Accept", "application/vnd.github+json")
 	request.Header.Set("Authorization", "Bearer "+token)
-	request.Header.Set("X-GitHub-Api-Version", apiVersion)
+	request.Header.Set("X-GitHub-Api-Version", version)
 	request.Header.Set("User-Agent", "cihash/0.1")
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")

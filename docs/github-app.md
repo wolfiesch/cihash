@@ -99,7 +99,7 @@ while the grant remains valid.
 
 For `opened`, `reopened`, `synchronize`, `ready_for_review`, and `edited` events:
 
-1. read the current PR and its `merge_commit_sha` instead of trusting revision fields in the webhook body, fetch that GitHub test-merge commit, then require its two parents to equal the current base and head before accepting its tree;
+1. read the current PR through GitHub's `2022-11-28` REST representation, which still exposes the documented `merge_commit_sha` omitted by `2026-03-10`, instead of trusting revision fields in the webhook body; fetch that test-merge commit and require its two parents to equal the current base and head before accepting its tree;
 2. reject fork PRs, which are outside the v0.1 trust boundary;
 3. derive the expected proof identity from the exact current head and base SHAs plus the approved server-side policy;
 4. load only evidence bound to an immutable server-issued run and matching submitted receipt digest;
