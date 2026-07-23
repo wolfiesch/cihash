@@ -24,6 +24,14 @@ const (
 	ParityNotComparable = "not_comparable"
 )
 
+// ReadinessWindow is the fixed, administrator-approved eligibility window
+// for the enforcement-ready gate. Observations older than this duration are
+// excluded from the readiness sample. The value is a package constant, not a
+// per-invocation parameter, so a report caller cannot cherry-pick a cutoff
+// that includes a recent match while excluding nearby pending or mismatch
+// evidence. All-time audit counts remain in the report regardless of age.
+const ReadinessWindow = 24 * time.Hour
+
 type Decision struct {
 	Repository            string    `json:"repository"`
 	PullRequestNumber     int64     `json:"pullRequestNumber"`
@@ -69,17 +77,24 @@ type Observation struct {
 }
 
 type Report struct {
-	SchemaVersion         string        `json:"schemaVersion"`
-	GeneratedAt           time.Time     `json:"generatedAt"`
-	Total                 int           `json:"total"`
-	Comparable            int           `json:"comparable"`
-	Pending               int           `json:"pending"`
-	Matches               int           `json:"matches"`
-	Mismatches            int           `json:"mismatches"`
-	BuildEvidenceComplete bool          `json:"buildEvidenceComplete"`
-	NotComparable         int           `json:"notComparable"`
-	EnforcementReady      bool          `json:"enforcementReady"`
-	Observations          []Observation `json:"observations"`
+	SchemaVersion               string        `json:"schemaVersion"`
+	GeneratedAt                 time.Time     `json:"generatedAt"`
+	WindowSeconds               int64         `json:"windowSeconds"`
+	Total                       int           `json:"total"`
+	Comparable                  int           `json:"comparable"`
+	Pending                     int           `json:"pending"`
+	Matches                     int           `json:"matches"`
+	Mismatches                  int           `json:"mismatches"`
+	BuildEvidenceComplete       bool          `json:"buildEvidenceComplete"`
+	NotComparable               int           `json:"notComparable"`
+	WindowComparable            int           `json:"windowComparable"`
+	WindowPending               int           `json:"windowPending"`
+	WindowMatches               int           `json:"windowMatches"`
+	WindowMismatches            int           `json:"windowMismatches"`
+	WindowNotComparable         int           `json:"windowNotComparable"`
+	WindowBuildEvidenceComplete bool          `json:"windowBuildEvidenceComplete"`
+	EnforcementReady            bool          `json:"enforcementReady"`
+	Observations                []Observation `json:"observations"`
 }
 
 type Store struct {
@@ -183,12 +198,16 @@ func (store Store) RecordWorkflow(repository string, workflow Workflow) (Observa
 }
 
 func (store Store) Report(now time.Time) (Report, error) {
+	now = now.UTC()
+	window := ReadinessWindow
 	report := Report{
-		SchemaVersion:         SchemaVersion,
-		GeneratedAt:           now.UTC(),
-		EnforcementReady:      false,
-		BuildEvidenceComplete: true,
-		Observations:          []Observation{},
+		SchemaVersion:               SchemaVersion,
+		GeneratedAt:                 now,
+		WindowSeconds:               int64(window.Seconds()),
+		EnforcementReady:            false,
+		BuildEvidenceComplete:       true,
+		WindowBuildEvidenceComplete: true,
+		Observations:                []Observation{},
 	}
 	directory := filepath.Join(store.root, "observations")
 	entries, err := os.ReadDir(directory)
@@ -209,21 +228,40 @@ func (store Store) Report(now time.Time) (Report, error) {
 		if !found {
 			continue
 		}
-		if !validGitObjectID(observation.Decision.ServiceSourceRevision) || observation.Decision.ServiceSourceModified || observation.Decision.ServiceBuildMode != "production" {
+		nonProductionBuild := !validGitObjectID(observation.Decision.ServiceSourceRevision) || observation.Decision.ServiceSourceModified || observation.Decision.ServiceBuildMode != "production"
+		if nonProductionBuild {
 			report.BuildEvidenceComplete = false
 		}
 		report.Observations = append(report.Observations, observation)
+		eligible := !observation.Decision.EvaluatedAt.After(now) && now.Sub(observation.Decision.EvaluatedAt) <= window
+		if eligible && nonProductionBuild {
+			report.WindowBuildEvidenceComplete = false
+		}
 		switch observation.Parity {
 		case ParityPending:
 			report.Pending++
+			if eligible {
+				report.WindowPending++
+			}
 		case ParityMatch:
 			report.Matches++
 			report.Comparable++
+			if eligible {
+				report.WindowMatches++
+				report.WindowComparable++
+			}
 		case ParityMismatch:
 			report.Mismatches++
 			report.Comparable++
+			if eligible {
+				report.WindowMismatches++
+				report.WindowComparable++
+			}
 		case ParityNotComparable:
 			report.NotComparable++
+			if eligible {
+				report.WindowNotComparable++
+			}
 		default:
 			return Report{}, fmt.Errorf("shadow observation %q has invalid parity %q", observation.ID, observation.Parity)
 		}
@@ -232,7 +270,7 @@ func (store Store) Report(now time.Time) (Report, error) {
 		return report.Observations[i].Decision.EvaluatedAt.Before(report.Observations[j].Decision.EvaluatedAt)
 	})
 	report.Total = len(report.Observations)
-	report.EnforcementReady = report.Comparable > 0 && report.Pending == 0 && report.Mismatches == 0 && report.BuildEvidenceComplete
+	report.EnforcementReady = report.WindowComparable > 0 && report.WindowPending == 0 && report.WindowMismatches == 0 && report.WindowBuildEvidenceComplete
 	return report, nil
 }
 

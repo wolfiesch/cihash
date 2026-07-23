@@ -161,6 +161,32 @@ binary digest, build mode, policy timeout, and observation timestamps in the
 administrator-owned state directory. Aggregate workflow conclusions are not
 used as a substitute for the selected job.
 
+### Enforcement readiness window
+
+Observations are immutable audit facts: a recorded proof decision and its
+correlated workflow evidence never change parity once written. Because
+real repositories accumulate pending observations whose matching workflow
+evidence never arrives (lost `workflow_run` deliveries, force-pushed heads,
+merged or closed pull requests), an all-time readiness gate would stay
+permanently blocked. CIHash instead derives `enforcementReady` over a
+fixed eligibility window (`shadow.ReadinessWindow`, 24 hours). The window
+is a package constant, not a per-invocation parameter: a report caller
+cannot choose a cutoff that includes a recent match while excluding nearby
+pending or mismatch evidence. Every parity class ages out of the window
+together; no class is selectively expired, and no observation is relabeled
+or removed. The all-time counts (`total`, `matches`, `mismatches`,
+`pending`, `comparable`, `notComparable`) remain in the report for audit,
+and `windowSeconds` records the fixed window governing the readiness
+sample.
+
+`enforcementReady` is true only when the windowed sample contains at least
+one comparable observation, zero pending observations, zero mismatches, and
+complete production build evidence. A single historical match cannot
+authorize readiness after every other observation ages out, because the
+window requires a fresh comparable observation. Manual state repair cannot
+manufacture readiness: only a clean comparable sample inside the fixed
+window can.
+
 ## Trusted fallback contract
 
 The fallback workflow must live on the protected base branch and declare these `workflow_dispatch` inputs:
